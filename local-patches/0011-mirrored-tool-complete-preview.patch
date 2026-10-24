@@ -1,0 +1,120 @@
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 268e303b80..b1a83beaca 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -4749,11 +4749,12 @@ export interface ToolStartPayload {
+   preview?: string | null
+   labels?: ToolLabel[] | null
+ }
+-/** ``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools. */
++/** ``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools. Mirrored child rows (``agent_callbacks._mirror_subagent_to_child``) re-emit the stored ``tool.start`` frame, so they may carry ``preview`` (ToolStartPayload legalises the same value on the same logical row) — regular gateway-emitted completes omit it. */
+ export interface ToolCompletePayload {
+   tool_id: string
+   name: string
+   args?: Record<string, unknown> | null
++  preview?: string | null
+   duration_s?: number | null
+   result?: unknown
+   summary?: string | null
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index c10dd42667..21bb18e517 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -36691,7 +36691,7 @@
+       },
+       "ToolCompletePayload": {
+         "additionalProperties": false,
+-        "description": "``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools.",
++        "description": "``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools.\n\nMirrored child rows (``agent_callbacks._mirror_subagent_to_child``) re-emit the stored\n``tool.start`` frame, so they may carry ``preview`` (ToolStartPayload legalises the same\nvalue on the same logical row) \u2014 regular gateway-emitted completes omit it.",
+         "properties": {
+           "tool_id": {
+             "title": "Tool Id",
+@@ -36714,6 +36714,18 @@
+             "default": null,
+             "title": "Args"
+           },
++          "preview": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Preview"
++          },
+           "duration_s": {
+             "anyOf": [
+               {
+diff --git a/tests/tui_gateway/contracts/test_mirror_tool_complete.py b/tests/tui_gateway/contracts/test_mirror_tool_complete.py
+new file mode 100644
+index 0000000000..b5343c4aac
+--- /dev/null
++++ b/tests/tui_gateway/contracts/test_mirror_tool_complete.py
+@@ -0,0 +1,41 @@
++"""patch-0011: mirrored child tool.complete rows may carry ``preview``.
++
++``agent_callbacks._mirror_subagent_to_child`` stores the ``tool.start`` dict and re-emits it
++as ``tool.complete``; ToolCompletePayload must therefore accept the same shape ToolStartPayload
++already legalises. Run under HERMES_TEST_ISOLATION (registry raises only there).
++"""
++
++import os
++
++import pytest
++
++from tui_gateway.contracts import registry
++
++pytestmark = pytest.mark.skipif(
++    not os.environ.get("HERMES_TEST_ISOLATION"), reason="needs HERMES_TEST_ISOLATION"
++)
++
++
++def test_mirror_child_tool_complete_accepts_preview():
++    assert registry.STRICT
++    registry.check_payload(
++        "tool.complete",
++        {
++            "tool_id": "submirror:child:1",
++            "name": "terminal",
++            "args": {},
++            "preview": "/some/file.py",
++        },
++    )
++    # The common mirror shape: args-only, no preview — must stay accepted.
++    registry.check_payload(
++        "tool.complete",
++        {"tool_id": "submirror:child:2", "name": "terminal", "args": {}},
++    )
++
++
++def test_unknown_field_still_rejected():
++    with pytest.raises(registry.ContractViolation, match="bogus_field"):
++        registry.check_payload(
++            "tool.complete", {"tool_id": "x", "name": "t", "bogus_field": "1"}
++        )
+diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
+index 6f27dd5e7a..0b4eb62340 100644
+--- a/tui_gateway/contracts/events.py
++++ b/tui_gateway/contracts/events.py
+@@ -281,11 +281,17 @@ event("tool.start", ToolStartPayload, doc="A tool call began (stable id + full a
+ 
+ 
+ class ToolCompletePayload(Payload):
+-    """``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools."""
++    """``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools.
++
++    Mirrored child rows (``agent_callbacks._mirror_subagent_to_child``) re-emit the stored
++    ``tool.start`` frame, so they may carry ``preview`` (ToolStartPayload legalises the same
++    value on the same logical row) — regular gateway-emitted completes omit it.
++    """
+ 
+     tool_id: str
+     name: str
+     args: dict[str, JsonValue] | None = None  # mirrored child rows / room relays omit it
++    preview: str | None = None  # mirrored child rows only (submirror:* tool ids)
+     duration_s: float | None = None
+     result: JsonValue = None
+     summary: str | None = None

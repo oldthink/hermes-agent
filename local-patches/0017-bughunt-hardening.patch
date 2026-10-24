@@ -1,0 +1,163 @@
+diff --git a/agent/runaway_watchdog.py b/agent/runaway_watchdog.py
+index aadd4db8d7..b34b749515 100644
+--- a/agent/runaway_watchdog.py
++++ b/agent/runaway_watchdog.py
+@@ -33,27 +33,34 @@ logger = logging.getLogger("agent.runaway_watchdog")
+ 
+ _DEFAULT_MAX_WAKES = 25
+ _DEFAULT_MAX_SILENT_HOURS = 4.0
++_CFG_CACHE_TTL_S = 5.0
+ 
+ _lock = threading.Lock()
+ # key -> {"synthetic_wakes": int, "last_user_monotonic": float, "held_notified": bool}
+ _states: dict = {}
++_cfg_cache: tuple[float, int, float] = (0.0, _DEFAULT_MAX_WAKES, _DEFAULT_MAX_SILENT_HOURS)
+ 
+ 
+ def _limits() -> tuple:
+-    """(max_synthetic_wakes, max_silent_hours): config first, env overrides, defaults on any error."""
+-    max_wakes = _DEFAULT_MAX_WAKES
+-    max_silent_hours = _DEFAULT_MAX_SILENT_HOURS
+-    try:
+-        from hermes_cli.config import cfg_get, load_config_readonly
+-        cfg = load_config_readonly()
+-        wakes = cfg_get(cfg, "agent", "runaway_max_synthetic_wakes")
+-        if isinstance(wakes, (int, float)) and not isinstance(wakes, bool) and wakes > 0:
+-            max_wakes = int(wakes)
+-        hours = cfg_get(cfg, "agent", "runaway_max_silent_hours")
+-        if isinstance(hours, (int, float)) and not isinstance(hours, bool) and hours > 0:
+-            max_silent_hours = float(hours)
+-    except Exception:
+-        pass
++    """(max_synthetic_wakes, max_silent_hours): config first (5s TTL cache), env overrides, defaults on error."""
++    global _cfg_cache
++    now = time.monotonic()
++    cached_at, max_wakes, max_silent_hours = _cfg_cache
++    if now - cached_at >= _CFG_CACHE_TTL_S:
++        max_wakes = _DEFAULT_MAX_WAKES
++        max_silent_hours = _DEFAULT_MAX_SILENT_HOURS
++        try:
++            from hermes_cli.config import cfg_get, load_config_readonly
++            cfg = load_config_readonly()
++            wakes = cfg_get(cfg, "agent", "runaway_max_synthetic_wakes")
++            if isinstance(wakes, (int, float)) and not isinstance(wakes, bool) and wakes > 0:
++                max_wakes = int(wakes)
++            hours = cfg_get(cfg, "agent", "runaway_max_silent_hours")
++            if isinstance(hours, (int, float)) and not isinstance(hours, bool) and hours > 0:
++                max_silent_hours = float(hours)
++        except Exception:
++            pass
++        _cfg_cache = (now, max_wakes, max_silent_hours)
+     try:
+         env_wakes = os.environ.get("HERMES_RUNAWAY_MAX_WAKES", "").strip()
+         if env_wakes:
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 95d8e0ba27..7f20e2c383 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -2248,13 +2248,13 @@ class TurnRunner:
+             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
+             agent._pending_fallback_notice = pending_fallback_notice
+         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+-        agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+-        persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+         bridge = getattr(self, "_desktop_bridge", None)
+-        if bridge is not None:
+-            bridge.session_id = str(getattr(agent, "session_id", None) or getattr(ctx, "session_id", None) or bridge.session_id)
+-            bridge.on_turn_start()
+         try:
++            agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
++            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
++            if bridge is not None:
++                bridge.session_id = str(getattr(agent, "session_id", None) or getattr(ctx, "session_id", None) or bridge.session_id)
++                bridge.on_turn_start()
+             result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+         finally:
+             if bridge is not None:
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index e3145a7bcf..c249334f0a 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -5267,6 +5267,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+             and str(getattr(role, "id", "")) != everyone_id
+         }
+ 
++    def _addressing_role_ids(self, message: Any) -> set:
++        """Held role IDs that are currently allowed to address this bot (`role_mentions` gate)."""
++        allow = self._discord_role_mentions()
++        if allow is False:
++            return set()
++        own = self._self_role_ids(message)
++        if not own:
++            return set()
++        if isinstance(allow, set):
++            own = own & allow
++        return own
++
+     def _self_is_role_mentioned(self, message: Any) -> bool:
+         """True when the message pings a role this bot actually holds.
+ 
+@@ -5274,29 +5286,24 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+         one the bot was removed from — still requires a real @mention. ``role_mentions``
+         further narrows the accepted set to explicit role IDs when configured that way.
+         """
+-        allow = self._discord_role_mentions()
+-        if allow is False:
+-            return False
+-        pinged = self._raw_mentioned_role_ids(message)
+-        if not pinged:
+-            return False
+-        own = self._self_role_ids(message)
++        own = self._addressing_role_ids(message)
+         if not own:
+             return False
+-        if isinstance(allow, set):
+-            own = own & allow
++        pinged = self._raw_mentioned_role_ids(message)
+         return bool(pinged & own)
+ 
+     def _strip_self_mention_tokens(self, content: str, message: Any) -> str:
+-        """Drop the tokens that addressed us — ``<@bot>``, ``<@!bot>`` and held-role pings.
++        """Drop the tokens that addressed us — ``<@bot>``, ``<@!bot>`` and addressing-role pings.
+ 
+         The agent should see the request, not Discord markup (previously a role ping survived
+-        into the prompt as a bare ``<@&ROLE_ID>``).
++        into the prompt as a bare ``<@&ROLE_ID>``). Only role IDs that actually address this
++        bot (respecting ``discord.role_mentions``) are stripped; non-addressing held roles stay
++        intact in the prompt.
+         """
+         if self._client and self._client.user:
+             content = content.replace(f"<@{self._client.user.id}>", "")
+             content = content.replace(f"<@!{self._client.user.id}>", "")
+-        for role_id in sorted(self._raw_mentioned_role_ids(message) & self._self_role_ids(message)):
++        for role_id in sorted(self._raw_mentioned_role_ids(message) & self._addressing_role_ids(message)):
+             content = content.replace(f"<@&{role_id}>", "")
+         return content.strip()
+ 
+diff --git a/tests/gateway/test_discord_role_mentions.py b/tests/gateway/test_discord_role_mentions.py
+index 87b615e964..8842c406a6 100644
+--- a/tests/gateway/test_discord_role_mentions.py
++++ b/tests/gateway/test_discord_role_mentions.py
+@@ -124,6 +124,22 @@ def test_foreign_role_ping_is_left_alone_in_the_prompt(monkeypatch):
+     assert adapter._strip_self_mention_tokens(text, _msg(text)) == text
+ 
+ 
++def test_non_addressing_held_role_is_preserved_under_csv_pin_or_flag_off(monkeypatch):
++    """When role_mentions pins only OWN_ROLE (or is disabled), a held SHARED_ROLE token
++    in the same message did not address us and must stay intact in the prompt."""
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    csv_adapter = _adapter(extra={"role_mentions": str(OWN_ROLE)})
++    both = f"<@&{OWN_ROLE}> tell <@&{SHARED_ROLE}> to check this"
++    assert csv_adapter._strip_self_mention_tokens(both, _msg(both)) == (
++        f"tell <@&{SHARED_ROLE}> to check this"
++    )
++    off_adapter = _adapter(extra={"role_mentions": "false"})
++    user_and_role = f"<@{BOT_ID}> tell <@&{SHARED_ROLE}> to check this"
++    assert off_adapter._strip_self_mention_tokens(user_and_role, _msg(user_and_role)) == (
++        f"tell <@&{SHARED_ROLE}> to check this"
++    )
++
++
+ # ---- ingress ---------------------------------------------------------------
+ 
+ @pytest.mark.asyncio

@@ -10,7 +10,6 @@ import logging
 import re
 import sqlite3
 import time
-from hermes_dir_acl import make_user_dir
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -22,7 +21,7 @@ MAX_RETAINED_RESULTS = 64
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
-    "termination_source", "notify_on_complete",
+    "termination_source", "notify_on_complete", "exited_at",
 )
 
 
@@ -60,11 +59,15 @@ def save_completed_result(session) -> None:
     try:
         from hermes_constants import assert_named_profile_home_live
         assert_named_profile_home_live(directory)
-        make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         atomic_json_write(directory / f"{session.id}.json", record, mode=0o600)
         _result_paths()
-    except OSError:
+    except Exception:
         # Preserve live delivery on disk failure, but never silently claim durability.
+        # Exception, not OSError: this runs inside _move_to_finished's registry lock —
+        # anything else (a lone surrogate before the json fallback, a profile guard
+        # raising non-OSError) would kill the reader thread holding the lock, wedging
+        # the whole registry and dropping the completion wake with the receipt.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
 
 
@@ -108,10 +111,13 @@ def load_completed_results(prefix: str = "") -> dict:
                 continue
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
+            # Pre-0004 receipts have no exited_at; the dataclass default (0.0 = unknown) must hold,
+            # so the key is deliberately absent from the expansion above and defaulted here.
             session = ProcessSession(
-                **{key: record[key] for key in _RESULT_FIELDS},
+                **{key: record[key] for key in _RESULT_FIELDS if key != "exited_at"},
                 exited=True, output_buffer=record["output"],
             )
+            session.exited_at = float(record.get("exited_at") or 0.0)
             session._completion_event.set()
             results[session.id] = session
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):

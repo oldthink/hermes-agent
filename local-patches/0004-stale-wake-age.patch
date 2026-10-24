@@ -1,0 +1,356 @@
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index 559021d6c0..dd96990480 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -2013,6 +2013,7 @@ class GatewayNotificationsMixin:
+             **{k: watcher.get(k, "") for k in _WATCHER_ROUTE_FIELDS},
+             "message_id": str(watcher.get("message_id") or "").strip() or None,
+             "started_at": getattr(session, "started_at", None),
++            "exited_at": getattr(session, "exited_at", 0.0) or 0.0,
+             "command": _redact_gateway_user_facing_secrets(_command),
+             "exit_code": session.exit_code,
+             "completion_reason": getattr(session, "completion_reason", "exited"),
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 39fbca4e3c..dd84ec26e1 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -332,6 +332,10 @@ DEFAULT_CONFIG = {
+         # Bounded linger (seconds) for one-shot CLI runs (-q/-Q/-z) that exit while background processes
+         # spawned with notify_on_complete=true are still running. See #90879.
+         "oneshot_completion_wait_seconds": 600.0,
++        # A completion wake delivered this many seconds after the process exited renders a
++        # STALE WAKE banner inside the notification (local patch 0004; 0 disables the banner,
++        # the "Completed <age> ago." line always shows when the exit time is known).
++        "stale_wake_after_seconds": 300.0,
+         # Env vars passed into sandboxed terminal/execute_code (skill-declared
+         # required_environment_variables pass through automatically).
+         "env_passthrough": [],
+diff --git a/tests/tools/test_stale_wake_age.py b/tests/tools/test_stale_wake_age.py
+new file mode 100644
+index 0000000000..ea0e96408c
+--- /dev/null
++++ b/tests/tools/test_stale_wake_age.py
+@@ -0,0 +1,221 @@
++"""Stale-wake age marker (local patch 0004).
++
++A completion wake is a synthetic *user* message. It can sit in the queue behind a long turn and be
++delivered long after the process exited. These tests pin: the exit time is stamped at all three event
++producers; the formatter shows the age and, past ``terminal.stale_wake_after_seconds``, a STALE banner
++INSIDE the unchanged ``[IMPORTANT: Background process`` frame; unknown exit time renders the legacy text
++byte-for-byte; and — the round-1 blocker — a stale wake is still classified as a SYNTHETIC message by
++every classifier that pins the prefix (compaction, anchor restoration, timeline, desktop regex).
++"""
++import re
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from tools import process_registry_notifications as prn
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++PREFIX = "[IMPORTANT: Background process "
++# apps/desktop/src/components/assistant-ui/thread/content.ts:3 (PROCESS_NOTIFICATION_RE), ported to Python
++DESKTOP_RE = re.compile(r"^\[IMPORTANT: Background process [\s\S]*\]$")
++
++
++def _evt(**kw):
++    base = {"type": "completion", "session_id": "proc_x", "command": "echo hi", "exit_code": 0,
++            "output": "done", "completion_reason": "exited"}
++    base.update(kw)
++    return base
++
++
++def _fmt(evt):
++    text = prn.format_process_notification(evt)
++    assert text is not None
++    return text
++
++
++@pytest.fixture()
++def fixed_now(monkeypatch):
++    now = 1_800_000_000.0
++    monkeypatch.setattr(prn.time, "time", lambda: now)
++    return now
++
++
++@pytest.fixture(autouse=True)
++def default_threshold(monkeypatch):
++    # isolate from the real config: 300 s unless a test overrides it
++    monkeypatch.setattr(ProcessRegistry, "_config_seconds", staticmethod(lambda key, fallback: fallback))
++
++
++class TestFormatter:
++    def test_fresh_event_shows_age_not_stale(self, fixed_now):
++        text = _fmt(_evt(exited_at=fixed_now - 3))
++        lines = text.split("\n")
++        assert lines[0].startswith(PREFIX + "proc_x completed normally (exit code 0).")
++        assert lines[1] == "Completed 3s ago."
++        assert "STALE WAKE" not in text
++
++    def test_58_minute_event_is_marked_stale_inside_the_frame(self, fixed_now):
++        text = _fmt(_evt(exited_at=fixed_now - 58 * 60))
++        assert text.startswith(PREFIX)
++        assert text.endswith("]")
++        assert "Completed 58m ago." in text
++        assert "STALE WAKE — completed 58m ago; delivered after a long turn." in text
++        assert text.index("STALE WAKE") < text.index("Command:")  # banner is the first body block
++
++    @pytest.mark.parametrize("exited", [None, 0, 0.0, "", "garbage"])
++    def test_unknown_exit_time_renders_the_legacy_text_byte_for_byte(self, exited):
++        legacy = _fmt(_evt())
++        assert _fmt(_evt(exited_at=exited)) == legacy
++        # Frozen pre-patch literal (parent commit): a wholesale re-render must still be caught.
++        assert legacy == ("[IMPORTANT: Background process proc_x completed normally (exit code 0).\n"
++                          "Command: echo hi\nOutput:\ndone]")
++        assert "Completed" not in legacy and "STALE" not in legacy
++
++    def test_threshold_is_read_from_config_key(self, fixed_now, monkeypatch):
++        seen = {}
++
++        def fake(key, fallback):
++            seen["key"], seen["fallback"] = key, fallback
++            return 10.0
++
++        monkeypatch.setattr(ProcessRegistry, "_config_seconds", staticmethod(fake))
++        assert "STALE WAKE" in _fmt(_evt(exited_at=fixed_now - 20))
++        assert "STALE WAKE" not in _fmt(_evt(exited_at=fixed_now - 5))
++        assert seen == {"key": "stale_wake_after_seconds", "fallback": 300.0}
++
++    def test_zero_threshold_disables_the_stale_marker_but_keeps_the_age(self, fixed_now, monkeypatch):
++        monkeypatch.setattr(ProcessRegistry, "_config_seconds", staticmethod(lambda key, fallback: 0.0))
++        text = _fmt(_evt(exited_at=fixed_now - 3600))
++        assert "Completed 1h ago." in text and "STALE WAKE" not in text
++
++    def test_real_config_helper_reads_the_declared_default(self, fixed_now, monkeypatch):
++        """No monkeypatch on _config_seconds: the production reader must resolve the
++        DEFAULT_CONFIG key this patch declared (300.0) — not the exception fallback."""
++        monkeypatch.setattr(prn.time, "time", lambda: fixed_now)
++        from hermes_cli.config_defaults import DEFAULT_CONFIG
++        assert DEFAULT_CONFIG["terminal"]["stale_wake_after_seconds"] == 300.0
++        assert prn._stale_wake_threshold_seconds() == 300.0
++
++    def test_killed_process_says_ended_not_completed(self, fixed_now):
++        text = _fmt(_evt(exited_at=fixed_now - 60, completion_reason="killed"))
++        assert "Ended 1m ago." in text and "Completed" not in text
++
++    def test_config_failure_falls_back_to_300(self, fixed_now, monkeypatch):
++        def boom(key, fallback):
++            raise RuntimeError("config unreadable")
++
++        monkeypatch.setattr(ProcessRegistry, "_config_seconds", staticmethod(boom))
++        assert "STALE WAKE" in _fmt(_evt(exited_at=fixed_now - 301))
++        assert "STALE WAKE" not in _fmt(_evt(exited_at=fixed_now - 299))
++
++    def test_future_exit_time_never_negative(self, fixed_now):
++        assert "Completed 0s ago." in _fmt(_evt(exited_at=fixed_now + 50))
++
++
++class TestProducers:
++    def test_registry_publish_finished_carries_exited_at(self):
++        reg = ProcessRegistry()
++        s = ProcessSession(id="proc_p", command="x", task_id="t", started_at=time.time(), exited=True,
++                           exit_code=0, output_buffer="o", notify_on_complete=True)
++        reg._running[s.id] = s
++        with patch.object(reg, "_write_checkpoint"):
++            reg._move_to_finished(s)
++        evt = reg.completion_queue.get_nowait()
++        assert evt["exited_at"] > 0 and abs(evt["exited_at"] - s.exited_at) < 1e-6
++
++    def test_registry_event_with_unknown_exit_time_is_zero(self):
++        reg = ProcessRegistry()
++        s = ProcessSession(id="proc_q", command="x", task_id="t", started_at=time.time(), exited=True,
++                           exit_code=0, output_buffer="o", notify_on_complete=True)
++        reg._running[s.id] = s
++        with patch.object(reg, "_write_checkpoint"):
++            reg._publish_finished(s, True)  # bypass _move_to_finished: exited_at never stamped
++        evt = reg.completion_queue.get_nowait()
++        assert evt["exited_at"] == 0.0
++        assert "Completed" not in _fmt(evt)
++
++    def test_gateway_builder_carries_exited_at(self):
++        from types import SimpleNamespace
++        from gateway.run_notifications import GatewayNotificationsMixin
++
++        sess = SimpleNamespace(output_buffer="out", command="echo hi", exit_code=0, task_id="t",
++                               started_at=1.0, exited_at=1234.5, completion_reason="exited")
++        evt = GatewayNotificationsMixin._build_process_completion_event({}, sess, "proc_g")
++        assert evt["exited_at"] == 1234.5
++
++    def test_bot_mode_dm_event_carries_exited_at(self, monkeypatch, fixed_now):
++        import threading
++        import tools.process_registry as pr_module
++        from tools import bot_mode_dm
++
++        captured = {}
++        proc = SimpleNamespace(_completion_event=threading.Event(), command="echo hi", exit_code=0,
++                               completion_reason="exited", termination_source=None, output_buffer="done",
++                               completion_output_chars=2000, task_id="t", started_at=1.0, exited_at=fixed_now - 60)
++        proc._completion_event.set()
++        monkeypatch.setattr(pr_module.process_registry, "get", lambda pid: proc)
++        monkeypatch.setattr(pr_module.process_registry, "is_completion_consumed", lambda pid: False)
++        import tools.process_registry_notifications as prn_module
++        monkeypatch.setattr(prn_module, "process_completion_display_text", lambda evts: "display")
++
++        class FakeDB:
++            def append_message(self, session_id, role, content, **kw):
++                captured["content"] = content
++
++        import threading as _th
++        done = _th.Event()
++        _orig_append = FakeDB.append_message
++        def _append(self, *a, **k):
++            _orig_append(self, *a, **k)
++            done.set()
++        FakeDB.append_message = _append
++        agent = SimpleNamespace(_session_db=FakeDB(), session_id="sess_dm")
++        assert bot_mode_dm._persist_reply_when_done("proc_b", agent) is True
++        assert done.wait(5), "daemon thread never persisted the reply (check _exit_snapshot attrs on the fake proc)"
++        assert "Completed 1m ago." in (captured.get("content") or "")
++
++
++class TestStaleWakeIsStillSynthetic:
++    """The round-1 blocker: the classifiers pin the literal prefix; a stale wake must keep it."""
++
++    @pytest.fixture()
++    def stale_text(self, fixed_now):
++        return _fmt(_evt(exited_at=fixed_now - 58 * 60))
++
++    def test_desktop_regex_matches(self, stale_text):
++        assert DESKTOP_RE.match(stale_text)
++
++    def test_ported_regex_equals_the_desktop_typescript_literal(self):
++        """Drift control: the ported pattern must equal content.ts PROCESS_NOTIFICATION_RE verbatim."""
++        import subprocess
++        ts_path = Path(__file__).resolve().parents[2] / "apps/desktop/src/components/assistant-ui/thread/content.ts"
++        ts = subprocess.run(["grep", "-o", r"PROCESS_NOTIFICATION_RE = /[^/]*/", str(ts_path)],
++                            capture_output=True, text=True).stdout.strip()
++        assert ts == "PROCESS_NOTIFICATION_RE = /^\\[IMPORTANT: Background process [\\s\\S]*\\]$/"
++
++    def test_compressor_treats_it_as_scaffolding(self, stale_text):
++        from agent.context_compressor import _synthetic_user_row
++        assert _synthetic_user_row(stale_text) is True
++
++    def test_anchor_restoration_does_not_treat_it_as_human_intent(self, stale_text):
++        from agent.conversation_compression import _is_real_user_message
++        assert _is_real_user_message({"role": "user", "content": stale_text}) is False
++
++    def test_timeline_classifies_it_as_synthetic_prompt(self, stale_text):
++        from hermes_state_timeline import _SYNTHETIC_PROMPT
++        assert _SYNTHETIC_PROMPT.match(stale_text)
++
++    def test_control_a_swapped_prefix_WOULD_be_classified_real(self, stale_text):
++        """Failure control: proves the classifier assertions above can fail. The rejected design
++        (prefix swap to [STALE WAKE) is read as real user input / a plain prompt by every classifier."""
++        swapped = stale_text.replace("[IMPORTANT: Background process ", "[STALE WAKE — background process ", 1)
++        from agent.context_compressor import _synthetic_user_row
++        from agent.conversation_compression import _is_real_user_message
++        from hermes_state_timeline import _SYNTHETIC_PROMPT
++        assert not DESKTOP_RE.match(swapped)
++        assert _synthetic_user_row(swapped) is False
++        assert _is_real_user_message({"role": "user", "content": swapped}) is True
++        assert not _SYNTHETIC_PROMPT.match(swapped)
+diff --git a/tools/bot_mode_dm.py b/tools/bot_mode_dm.py
+index e807596a9a..b92917fa0c 100644
+--- a/tools/bot_mode_dm.py
++++ b/tools/bot_mode_dm.py
+@@ -785,7 +785,8 @@ def _persist_reply_when_done(proc_id: str, agent: Any) -> bool:
+         proc._completion_event.wait()
+         if process_registry.is_completion_consumed(proc_id):
+             return
+-        evt = {"type": "completion", "session_id": proc_id, **process_registry._exit_snapshot(proc, "exited")}
++        evt = {"type": "completion", "session_id": proc_id, **process_registry._exit_snapshot(proc, "exited"),
++               "exited_at": getattr(proc, "exited_at", 0.0) or 0.0}
+         try:
+             db.append_message(session_id, "user", content=format_process_notification(evt),
+                               display_kind="process_complete",
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index bb7f60ddd7..8bb4fd12c0 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1632,6 +1632,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
+                 # Stable producer identity across checkpoint recovery (unlike a
+                 # consumer-observed completion timestamp).
+                 "started_at": session.started_at,
++                # Exit time (0.0 = unknown) so the consumer can tell how stale a delivered wake is.
++                "exited_at": getattr(session, "exited_at", 0.0) or 0.0,
+             }
+             _redact_process_result(notification)
+             self.completion_queue.put(notification)
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index 4df4eee289..a1489c6c29 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -67,6 +67,36 @@ def _format_age(seconds: float) -> str:
+     return f"{h}h" + (f"{m}m" if m else "")
+ 
+ 
++def _stale_wake_threshold_seconds() -> float:
++    """``terminal.stale_wake_after_seconds`` (default 300; 0 disables the STALE marker; fail-safe 300)."""
++    try:
++        from tools.process_registry import ProcessRegistry
++        return ProcessRegistry._config_seconds("stale_wake_after_seconds", 300.0)
++    except Exception:
++        return 300.0
++
++
++def _completion_age_banner(evt: dict) -> str:
++    """Age line(s) for a completion wake, placed as the first BODY lines inside the unchanged
++    ``[IMPORTANT: Background process …]`` frame. '' when the exit time is unknown, so legacy/restored
++    events render byte-identically. The prefix is never altered: engine and desktop classifiers
++    (compaction, timeline, PROCESS_NOTIFICATION_RE) pin it to recognise a synthetic message."""
++    try:
++        exited = float(evt.get("exited_at") or 0.0)
++    except (TypeError, ValueError):
++        return ""
++    if exited <= 0:
++        return ""
++    age = max(0.0, time.time() - exited)
++    verb = "Ended" if evt.get("completion_reason") in ("killed", "lost", "failed_start") else "Completed"
++    banner = f"{verb} {_format_age(age)} ago.\n"
++    threshold = _stale_wake_threshold_seconds()
++    if threshold > 0 and age >= threshold:
++        banner += (f"STALE WAKE — {verb.lower()} {_format_age(age)} ago; delivered after a long turn. "
++                   "Informational only: if you already consumed this output do not reply or act on it.\n")
++    return banner
++
++
+ def _model_not_found_patterns() -> "list[str]":
+     """Model-not-found phrases from ``agent.error_classifier`` (the failover path's
+     own list, so nothing drifts); a minimal built-in set if the import fails.
+@@ -451,4 +481,5 @@ def format_process_notification(evt: dict) -> "str | None":
+                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
+     return (
+         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
++        f"{_completion_age_banner(evt)}"
+         f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index 2a9a9bb8f6..d7ba9cf52d 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -21,7 +21,7 @@ MAX_RETAINED_RESULTS = 64
+ _RESULT_FIELDS = (
+     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
+     "parent_session_id", "started_at", "exit_code", "completion_reason",
+-    "termination_source", "notify_on_complete",
++    "termination_source", "notify_on_complete", "exited_at",
+ )
+ 
+ 
+@@ -107,10 +107,13 @@ def load_completed_results(prefix: str = "") -> dict:
+                 continue
+             if not _owns_result(owner, record.get("parent_session_id")):
+                 continue
++            # Pre-0004 receipts have no exited_at; the dataclass default (0.0 = unknown) must hold,
++            # so the key is deliberately absent from the expansion above and defaulted here.
+             session = ProcessSession(
+-                **{key: record[key] for key in _RESULT_FIELDS},
++                **{key: record[key] for key in _RESULT_FIELDS if key != "exited_at"},
+                 exited=True, output_buffer=record["output"],
+             )
++            session.exited_at = float(record.get("exited_at") or 0.0)
+             session._completion_event.set()
+             results[session.id] = session
+         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):

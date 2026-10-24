@@ -8,8 +8,44 @@ export function transcriptRowIds(message: ChatMessage): number[] {
   return message.rowId === undefined ? ids : [message.rowId, ...ids]
 }
 
+/**
+ * Durable logical ids a message answers to: its own `messageUid` plus the final
+ * row uid named by a terminal-frame receipt. Unlike physical row ids these
+ * survive compaction re-inserts, so they are the identity of last resort when
+ * every row-id pairing misses (a foreign-bridge turn's settled bubble meeting
+ * the canonical hydrated row).
+ */
+export function transcriptUids(message: ChatMessage): string[] {
+  const uids: string[] = []
+
+  if (typeof message.messageUid === 'string' && message.messageUid) {
+    uids.push(message.messageUid)
+  }
+
+  const receiptUid = message.persistedTurn?.message_uid
+
+  if (typeof receiptUid === 'string' && receiptUid && !uids.includes(receiptUid)) {
+    uids.push(receiptUid)
+  }
+
+  return uids
+}
+
+/** True when the two messages share a durable logical id (uid) — same reply. */
+export function sharesMessageUid(a: ChatMessage, b: ChatMessage): boolean {
+  const aUids = transcriptUids(a)
+
+  return Boolean(aUids.length && transcriptUids(b).some(uid => aUids.includes(uid)))
+}
+
 /** Unknown identity is not a match, but remains eligible for legacy live projection. */
 export function conflictingTranscriptIdentity(local: ChatMessage, authoritative: ChatMessage): boolean {
+  // A shared uid is a POSITIVE durable claim that beats any row-id mismatch:
+  // a compaction re-insert gives the same logical row a new physical id.
+  if (sharesMessageUid(local, authoritative)) {
+    return false
+  }
+
   const localIds = transcriptRowIds(local)
   const authoritativeIds = transcriptRowIds(authoritative)
 

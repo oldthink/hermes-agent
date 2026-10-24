@@ -85,7 +85,7 @@ def _op_shape_error(action: str, args: dict):
 
 def _validate_batch_ops(operations, default_name, tool_error):
     """Shape checks with no side effects. Returns (names, None) or (None, error_json)."""
-    from tools.skill_manager_guards import _background_review_preflight
+    from tools.skill_manager_guards import _background_review_preflight, _lane_lock_error
     from tools.skill_manager_tool import _validate_category
     def fail(i, msg):
         return None, tool_error(f"operations[{i}]{msg}", success=False)
@@ -113,6 +113,21 @@ def _validate_batch_ops(operations, default_name, tool_error):
             return fail(i, f": create for '{nm}' must precede that skill's other ops.")
         if (preflight := _background_review_preflight(act, nm)) is not None:
             return None, json.dumps(preflight, ensure_ascii=False)
+        # Lane-lock early refusal (Fix C): a target whose parent dir is not writable would
+        # fail MID-batch (after snapshotting) and cascade into a rollback that historically
+        # left quarantine litter. Refuse before any side effect, with the sanctioned route.
+        if act != "create":
+            from tools import skill_manager_tool as _smt
+            found = _smt._find_skill(nm)
+            if found:
+                skill_dir = Path(found["path"])
+                fp = (op.get("file_path") or "").strip()
+                if fp and act in ("write_file", "remove_file"):
+                    target = skill_dir / posixpath.normpath(fp.lstrip("/"))
+                else:
+                    target = skill_dir / "SKILL.md"
+                if (lock_err := _lane_lock_error(nm, target)) is not None:
+                    return fail(i, f" ({act} on '{nm}'): {lock_err}")
     # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on
     # a file an earlier op touched would SILENTLY discard its work — reject it.
     # Additive patches are always legal. Paths are normalized against spelling variants.
@@ -148,20 +163,50 @@ def _snapshot_skills(names, snap_root, find_skill, create_targets):
         if snap is not None:
             try:
                 shutil.copytree(pre_dir, snap)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
                 return None, f"Could not snapshot '{nm}' for atomic batch: {exc}"
         target = create_targets.get(nm) if pre is None else None
         snapshots[nm] = (pre_dir, snap, target is not None and target.is_dir())
     return snapshots, None
 
 
+def _rmtree_hard(path: Path) -> None:
+    """Delete *path* for real: the handler chmods each failing PARENT DIR u+rwx and retries
+    the unlink; a final failure RAISES (never silent). Read-only dirs (lane-skill 555
+    snapshots) made plain rmtree a no-op whose leftovers re-registered as skill-name
+    collisions (RC1)."""
+    import os as _os
+
+    def _handler(fn, p, exc):
+        if isinstance(exc, tuple) and len(exc) > 1:  # onerror hands sys.exc_info()
+            exc = exc[1]
+        try:
+            # Unlink/rmdir need write on the CONTAINING dir, not the entry itself.
+            parent = _os.path.dirname(p)
+            _os.chmod(parent, _os.stat(parent).st_mode | 0o700)
+            fn(p)
+        except OSError as first:
+            try:
+                _os.chmod(p, _os.stat(p).st_mode | 0o700)
+                fn(p)
+            except OSError as final:
+                raise OSError(f"cannot remove '{p}': {final}") from (exc if isinstance(exc, BaseException) else first)
+
+    import shutil as _shutil
+    try:  # onexc: Python 3.12+; 3.14 removed onerror
+        _shutil.rmtree(path, onexc=_handler)
+    except TypeError:  # Python 3.11: onerror only
+        _shutil.rmtree(path, onerror=_handler)
+
+
 def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()) -> None:
-    post_exists = post_dir is not None and post_dir.is_dir()
+    if post_dir is None or not post_dir.is_dir():
+        if snap is not None:
+            shutil.copytree(snap, pre_dir)
+        return
     if snap is None:
-        if not post_exists:
-            return
         if not dir_pre_existed:  # Batch created this skill: remove the partial result.
-            shutil.rmtree(post_dir)
+            _rmtree_hard(post_dir)
             return
         # The dir predates the batch (adopted empty leftover): unlink exactly the files the
         # batch wrote there, then rmdir() the now-empty dirs up to and including the skill dir.
@@ -178,22 +223,41 @@ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()
         with suppress(OSError):
             post_dir.rmdir()
         return
-    if not post_exists:
-        shutil.copytree(snap, pre_dir)
-        return
     # Move the broken state aside and delete it only after the snapshot is
     # back, so a failed copytree (disk full, locked file) can't mean total loss.
-    aside = post_dir.with_name(post_dir.name + ".rollback-broken")
-    shutil.rmtree(aside, ignore_errors=True)
-    post_dir.rename(aside)
+    # The aside lives OUTSIDE the skills tree (<hermes-home>/backups/skill-rollbacks/):
+    # an undeletable leftover inside the skills root kept its duplicate frontmatter
+    # ``name:`` and collided with the live skill on every later resolution (RC1).
+    from hermes_constants import get_hermes_home
+    backups_root = Path(get_hermes_home()) / "backups" / "skill-rollbacks"
+    backups_root.mkdir(parents=True, exist_ok=True)
+    aside = Path(tempfile.mkdtemp(prefix=f"{post_dir.name}-", dir=backups_root))
+    _move_tree(post_dir, aside / "state")
     try:
         shutil.copytree(snap, pre_dir)
     except Exception:
         # Restore failed: put the half-applied state back rather than nothing.
         shutil.rmtree(pre_dir, ignore_errors=True)
-        aside.rename(pre_dir)
+        _move_tree(aside / "state", pre_dir)
+        with suppress(OSError):  # already raising the original; cleanup is best-effort here
+            _rmtree_hard(aside)
         raise
-    shutil.rmtree(aside, ignore_errors=True)
+    try:
+        _rmtree_hard(aside)
+    except OSError as exc:
+        # The live skill IS restored; only the quarantine cleanup failed. Name the
+        # aside so the operator can remove it — never a silent leftover (RC1).
+        raise OSError(f"snapshot restored but the quarantined broken state could not be "
+                      f"deleted: '{aside}' ({exc})") from exc
+
+
+def _move_tree(src: Path, dst: Path) -> None:
+    """Rename, falling back to copy+rm across filesystems (EXDEV-safe)."""
+    try:
+        src.rename(dst)
+    except OSError:
+        shutil.copytree(src, dst)
+        _rmtree_hard(src)
 
 
 def _rollback(snapshots, find_skill, results):
@@ -207,7 +271,7 @@ def _rollback(snapshots, find_skill, results):
             post = find_skill(nm)
             _restore_snapshot(pre_dir, snap, Path(post["path"]) if post else None,
                               dir_pre_existed, written)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
                          + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))
     return ("; ".join(notes) if notes else "all touched skills rolled back"), bool(notes)
@@ -216,8 +280,8 @@ def _rollback(snapshots, find_skill, results):
 _ADVISORY_KEYS = ("lint_warnings", "lint_hint")
 
 
-def _skill_manage_batch(operations, default_name: str | None = None, task_id: str | None = None,
-                        session_id: str | None = None) -> str:
+def _skill_manage_batch(operations, default_name: str = None, task_id: str = None,
+                        session_id: str = None) -> str:
     """Apply operations atomically: every touched skill is snapshotted first and any
     failure rolls ALL of them back (batch-created skills are removed). ``delete`` is
     only legal as the SOLE op (its recoverable-archive path doesn't compose with
@@ -271,7 +335,7 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
                                               task_id=task_id, session_id=session_id)
                 try:
                     parsed = json.loads(raw)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     parsed = {"success": False, "error": "unparseable op result"}
                 if not parsed.get("success"):
                     note, rollback_failed = _rollback(snapshots, _smt._find_skill, results)

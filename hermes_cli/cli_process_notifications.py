@@ -1,5 +1,7 @@
 """CLI notification ownership, structured queueing and last-moment consumption."""
 
+import logging
+
 
 class CLIProcessNotificationsMixin:
     def _owns_process_notification(self, event: dict) -> bool:
@@ -34,13 +36,18 @@ class CLIProcessNotificationsMixin:
         return mode == "off"
 
     def _drain_process_notifications(self, consumer: str) -> None:
-        from hermes_cli.gateway_tools_notify import gateway_store, queue_admitted_turn
-        store = gateway_store(self)
-        if store is not None:
-            # The process registry and its delivery claims live in the gateway, which admits the
-            # notification turn itself; this viewer only paints it (IPS-086).
-            queue_admitted_turn(self, store)
+        from agent.estop import check_paused
+        # Local patch 0001: estop holds CLI process-wake drains too — the queue keeps the
+        # events; the idle/post-turn poller re-drains them as one batch after resume.
+        if check_paused("cli-process-wakes", logging.getLogger("hermes_cli.process_notifications")):
             return
+        # Local patch 0002: per-session runaway watchdog bounds auto-wake chains. Held = leave
+        # queued (return before draining); a genuine user submit resets the counter (A1).
+        _runaway_key = getattr(self, "session_id", "") or ""
+        if _runaway_key:
+            from agent.runaway_watchdog import note_claim_success as _runaway_claimed, should_allow as _runaway_allow
+            if not _runaway_allow(_runaway_key, "cli"):
+                return
         from tools.process_registry import process_registry
         from tools.async_delegation import claim_event_delivery, complete_event_delivery
         from tools.process_registry_notifications import (
@@ -72,6 +79,10 @@ class CLIProcessNotificationsMixin:
                 if diagnostic_process_event(event) and not isinstance(pending, TimelineNotification):
                     pending = TimelineNotification(text, text, "internal_notification", "diagnostic")
             self._pending_input.put(pending)
+            if evt_type == "completion" and _runaway_key:
+                # Count only completion batches actually queued (A3) — heartbeat/delegation
+                # groups and suppressed drains do not start a process-completion wake turn.
+                _runaway_claimed(_runaway_key)
 
     def _tui_unwrap_input(self, user_input):
         """Unwrap ``_VoiceInputMessage`` / ``_SeededQueryMessage`` -> ``(text_or_tuple, is_voice_input, is_seeded_query)``."""
@@ -90,8 +101,6 @@ class CLIProcessNotificationsMixin:
             user_input = user_input.text
         is_seeded_query = isinstance(user_input, _SeededQueryMessage)
         if is_seeded_query:
-            from hermes_cli.gateway_tools_notify import arm_adopted
-            arm_adopted(self, user_input)
             user_input = (user_input.text, user_input.images) if user_input.images else user_input.text
         return user_input, is_voice_input, is_seeded_query
 

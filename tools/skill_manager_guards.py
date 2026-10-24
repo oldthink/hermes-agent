@@ -13,8 +13,28 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("tools.skill_manager_tool")
 
 
-def _refusal(message: str, **extra: Any) -> dict[str, Any]:
+def _refusal(message: str, **extra: Any) -> Dict[str, Any]:
     return {"success": False, "error": message, **extra}
+
+
+def _lane_lock_error(name: str, target: Path) -> Optional[str]:
+    """Actionable refusal when a write target's parent dir is not writable (lane skill
+    lock: SKILL.md's dir is 555, references/ stays 755). ``None`` when writable.
+    Checked EARLY — before any snapshot — so a locked target is a loud skip, not a
+    mid-batch permission failure that cascades into a rollback."""
+    import os as _os
+    probe = target.parent
+    try:
+        while not probe.exists():  # a not-yet-created subdir inherits its ancestor's writability
+            if probe.parent == probe:
+                return None  # walked off the tree: let the write path surface the real error
+            probe = probe.parent
+        if _os.access(probe, _os.W_OK):
+            return None
+    except OSError:
+        return None  # unstat-able: let the write path surface the real error
+    return (f"lane skill '{name}' is locked (dir not writable: {probe}); route SKILL.md "
+            f"edits through ~/.hermes/scripts/lane-edit.sh; references/ stays writable by design")
 
 
 def _is_background_review() -> bool:
@@ -48,7 +68,7 @@ class _BackgroundReviewReadMarks:
             return path in self._paths
 
 
-_background_review_read_paths: _ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]] = (
+_background_review_read_paths: "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]" = (
     _ctxvars.ContextVar("background_review_read_paths", default=None))
 
 
@@ -161,7 +181,7 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
-def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[dict[str, Any]]:
+def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[Dict[str, Any]]:
     """Refuse autonomous deletes of anything but curator-owned sediment. Content writes are not
     gated by ownership: the review fork exists to improve every skill it learns from, and every
     write is ledgered and reversible, while an archive removes a skill the user relies on."""
@@ -209,7 +229,7 @@ def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[dict
 
 
 def _background_review_read_before_write_guard(
-    name: str, target: Path, action: str, file_label: str) -> Optional[dict[str, Any]]:
+    name: str, target: Path, action: str, file_label: str) -> Optional[Dict[str, Any]]:
     """Require review forks to load the exact target before mutating it."""
     if not _is_background_review() or _background_review_has_read(target):
         return None
@@ -221,7 +241,7 @@ def _background_review_read_before_write_guard(
         _read_before_write_required=True)
 
 
-def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
+def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
     if action != "delete":
         return None
     from tools import skill_manager_tool as _smt
@@ -230,7 +250,7 @@ def _background_review_preflight(action: str, name: str) -> Optional[dict[str, A
 
 
 def _curator_consolidation_delete_guard(
-    name: str, absorbed_into: Optional[str]) -> Optional[dict[str, Any]]:
+    name: str, absorbed_into: Optional[str]) -> Optional[Dict[str, Any]]:
     """Fail closed on unverified deletes during the curator consolidation pass. The fork's only
     legitimate delete is a consolidation declared via ``absorbed_into=<umbrella>`` (existence
     validated in ``_delete_skill``); the deterministic inactivity prune never calls skill_manage,

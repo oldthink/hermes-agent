@@ -1,0 +1,510 @@
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index f8e8d09e25..984024cc3b 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -75,6 +75,209 @@ class _ExecApprovalDeclined(RuntimeError):
+     """
+ 
+ 
++class _DesktopSessionEventBridge:
++    """Non-blocking loopback relay from a gateway turn to a running ``hermes serve`` Desktop backend (patch 0010).
++
++    Queues live stream deltas (``reasoning.delta``, ``message.delta``), interim commentary, tool lifecycle
++    events (``tool.generating``, ``tool.start``, ``tool.complete``), and turn boundaries (``message.start``,
++    ``message.complete``) onto a bounded background daemon thread that batches and POSTs them to the local
++    ``hermes serve`` instance discovered via ``gateway.host_rendezvous``. Never blocks the agent thread and
++    silently drops when no Desktop backend is listening.
++    """
++
++    _QUEUE_MAX = 4096
++    _STOP = object()
++    _ENDPOINT_TTL_S = 10.0
++
++    def __init__(self, session_id: str) -> None:
++        self.session_id = str(session_id or "").strip()
++        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=self._QUEUE_MAX)
++        self._tool_started_at: dict[str, float] = {}
++        self._endpoint_cache: tuple[float, Optional[tuple[str, str]]] = (0.0, None)
++        self._thread: Optional[threading.Thread] = None
++        if self.session_id:
++            self._thread = threading.Thread(
++                target=self._worker, daemon=True, name=f"desktop-bridge:{self.session_id[:16]}"
++            )
++            self._thread.start()
++
++    def _resolve_endpoint(self) -> Optional[tuple[str, str]]:
++        now = time.monotonic()
++        cached_at, cached = self._endpoint_cache
++        if now - cached_at < self._ENDPOINT_TTL_S:
++            return cached
++        result: Optional[tuple[str, str]] = None
++        with suppress(Exception):
++            from gateway import host_rendezvous as hr
++            from hermes_cli.plugins_activation import _serve_backend_record
++            from hermes_cli.url_utils import format_url_host
++
++            record = _serve_backend_record()
++            if record is not None and record.port:
++                token = hr.read_token(record.role)
++                if token:
++                    url = (
++                        f"http://{format_url_host(hr.dial_host(record))}:{record.port}"
++                        "/api/dashboard/foreign-session-event"
++                    )
++                    result = (url, token)
++        self._endpoint_cache = (now, result)
++        return result
++
++    def emit(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
++        if not self.session_id or self._thread is None:
++            return
++        from tui_gateway.contracts import registry as _contracts
++        _contracts.check_payload(event, payload)  # STRICT -> raises; prod -> log-and-continue (receiver parity server.py:702)
++        item = {"event": event, "session_id": self.session_id, "payload": payload}
++        try:
++            self._queue.put_nowait(item)
++        except queue.Full:
++            with suppress(queue.Empty):
++                self._queue.get_nowait()
++            with suppress(queue.Full):
++                self._queue.put_nowait(item)
++
++    def on_turn_start(self) -> None:
++        self.emit("message.start", {})
++
++    def on_text_delta(self, text: Optional[str]) -> None:
++        if isinstance(text, str) and text:
++            self.emit("message.delta", {"text": text})
++
++    def on_reasoning_delta(self, text: Optional[str]) -> None:
++        if isinstance(text, str) and text:
++            self.emit("reasoning.delta", {"text": text})
++
++    def on_interim(self, text: str, *, already_streamed: bool = False) -> None:
++        if isinstance(text, str) and text.strip():
++            self.emit("message.interim", {"text": text, "already_streamed": bool(already_streamed)})
++
++    def on_tool_gen(self, name: str) -> None:
++        if name:
++            self.emit("tool.generating", {"name": str(name)})
++
++    def on_tool_start(self, call_id: str, tool_name: str, args: dict) -> None:
++        cid = str(call_id or "")
++        name = str(tool_name or "tool")
++        self._tool_started_at[cid] = time.time()
++        context = ""
++        labels = None
++        with suppress(Exception):
++            # suppress covers cold import, build_tool_preview and producer/skin failures —
++            # agent/display.py's internal try only wraps import + labels_for_call, not
++            # _get_skin()/override application (rationale: draft-fix-v3 Change 1).
++            from agent.display import build_tool_preview, tool_labels_for_call
++            context = build_tool_preview(name, args or {}, max_len=80) or ""
++            labels = [label.as_payload() for label in tool_labels_for_call(name, args or {})] or None
++        payload: Dict[str, Any] = {"tool_id": cid, "name": name, "context": context}
++        if labels:
++            payload["labels"] = labels
++        if isinstance(args, dict) and args:
++            payload["args"] = args
++        self.emit("tool.start", payload)
++
++    def on_tool_complete(self, call_id: str, tool_name: str, args: dict, result: Any) -> None:
++        cid = str(call_id or "")
++        name = str(tool_name or "tool")
++        started_at = self._tool_started_at.pop(cid, None)
++        duration_s = (time.time() - started_at) if started_at else None
++        payload: Dict[str, Any] = {"tool_id": cid, "name": name, "args": args if isinstance(args, dict) else {}}
++        if duration_s is not None:
++            payload["duration_s"] = duration_s
++        if isinstance(result, str):
++            try:
++                payload["result"] = json.loads(result)
++            except Exception:
++                payload["result"] = result
++        else:
++            payload["result"] = result
++        self.emit("tool.complete", payload)
++
++    def on_turn_complete(self, result: Dict[str, Any]) -> None:
++        if not isinstance(result, dict):
++            result = {}
++        final_text = str(result.get("final_response") or "")
++        payload: Dict[str, Any] = {
++            "text": final_text,
++            "response_previewed": bool(result.get("response_previewed", False)),
++            "response_transformed": bool(result.get("response_transformed", False)),
++            "status": ("interrupted" if result.get("interrupted")
++                       else "error" if (result.get("error") or result.get("failed")) else "complete"),
++        }
++        if result.get("error"):
++            payload["error"] = str(result["error"])
++        self.emit("message.complete", payload)
++
++    def close(self, timeout: float = 1.5) -> None:
++        if self._thread is None:
++            return
++        with suppress(queue.Full):
++            self._queue.put_nowait(self._STOP)
++        self._thread.join(timeout=timeout)
++        self._thread = None
++
++    def _worker(self) -> None:
++        import urllib.request
++        batch: list[Dict[str, Any]] = []
++        stop_seen = False
++        while not stop_seen:
++            try:
++                item = self._queue.get(timeout=0.5)
++            except queue.Empty:
++                continue
++            if item is self._STOP:
++                stop_seen = True
++            else:
++                batch.append(item)
++            # Coalesce rapid deltas occurring within a 25ms window into one HTTP POST
++            deadline = time.monotonic() + 0.025
++            while len(batch) < 64 and not stop_seen:
++                rem = deadline - time.monotonic()
++                if rem <= 0:
++                    break
++                try:
++                    nxt = self._queue.get(timeout=rem)
++                except queue.Empty:
++                    break
++                if nxt is self._STOP:
++                    stop_seen = True
++                    break
++                batch.append(nxt)
++            if not batch:
++                continue
++            ep = self._resolve_endpoint()
++            if ep is not None:
++                url, token = ep
++                # Merge consecutive deltas of the same event type to minimize frames
++                merged: list[Dict[str, Any]] = []
++                for ev in batch:
++                    if (
++                        merged
++                        and ev["event"] in ("message.delta", "reasoning.delta")
++                        and merged[-1]["event"] == ev["event"]
++                        and merged[-1]["session_id"] == ev["session_id"]
++                    ):
++                        merged[-1]["payload"] = {
++                            "text": str((merged[-1].get("payload") or {}).get("text") or "")
++                            + str((ev.get("payload") or {}).get("text") or "")
++                        }
++                    else:
++                        merged.append(ev)
++                try:
++                    req = urllib.request.Request(
++                        url,
++                        data=json.dumps({"events": merged}, default=str).encode("utf-8"),
++                        method="POST",
++                        headers={"Content-Type": "application/json", "X-Hermes-Session-Token": token},
++                    )
++                    with urllib.request.urlopen(req, timeout=1.5) as resp:  # noqa: S310 — loopback http
++                        resp.read()
++                except Exception:
++                    self._endpoint_cache = (0.0, None)
++            batch.clear()
++
++
+ class TurnRunner:
+     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
+ 
+@@ -1303,10 +1506,63 @@ class TurnRunner:
+             agent.tool_progress_callback = None
+             agent.tool_start_callback = None
+             agent.tool_complete_callback = None
++            agent.tool_gen_callback = None
++            agent.reasoning_callback = None
+             # Keep diagnostic observers installed; concrete sinks veto display.
+             agent.stream_delta_callback = None
+             agent.interim_assistant_callback = None
+             agent.thinking_progress = False
++        else:
++            # Patch 0010: tee live stream/tool/reasoning callbacks to a running Desktop backend
++            # without altering platform delivery (e.g. Discord streaming stay off while Desktop
++            # receives real-time deltas).
++            bridge = _DesktopSessionEventBridge(str(getattr(agent, "session_id", None) or getattr(ctx, "session_id", None) or ""))
++            self._desktop_bridge = bridge
++            orig_start = agent.tool_start_callback
++            orig_complete = agent.tool_complete_callback
++            orig_delta = agent.stream_delta_callback
++            orig_interim = agent.interim_assistant_callback
++            orig_reasoning = getattr(agent, "reasoning_callback", None)
++
++            def _bridged_tool_start(call_id, tool_name, args):
++                if orig_start is not None:
++                    with suppress(Exception):
++                        orig_start(call_id, tool_name, args)
++                bridge.on_tool_start(call_id, tool_name, args)
++
++            def _bridged_tool_complete(call_id, tool_name, args, result):
++                if orig_complete is not None:
++                    with suppress(Exception):
++                        orig_complete(call_id, tool_name, args, result)
++                bridge.on_tool_complete(call_id, tool_name, args, result)
++
++            def _bridged_delta(text):
++                if orig_delta is not None:
++                    with suppress(Exception):
++                        orig_delta(text)
++                if ctx._run_still_current():
++                    bridge.on_text_delta(text)
++
++            def _bridged_interim(text, *, already_streamed=False):
++                if orig_interim is not None:
++                    with suppress(Exception):
++                        orig_interim(text, already_streamed=already_streamed)
++                if ctx._run_still_current():
++                    bridge.on_interim(text, already_streamed=already_streamed)
++
++            def _bridged_reasoning(text):
++                if orig_reasoning is not None:
++                    with suppress(Exception):
++                        orig_reasoning(text)
++                if ctx._run_still_current():
++                    bridge.on_reasoning_delta(text)
++
++            agent.tool_start_callback = _bridged_tool_start
++            agent.tool_complete_callback = _bridged_tool_complete
++            agent.tool_gen_callback = lambda name: bridge.on_tool_gen(name) if ctx._run_still_current() else None
++            agent.stream_delta_callback = _bridged_delta
++            agent.interim_assistant_callback = _bridged_interim if want_interim_messages else orig_interim
++            agent.reasoning_callback = _bridged_reasoning
+         ctx.agent_holder[0] = agent  # interrupt support
+         # The titler fires from the turn prologue, so attach the rename lane before the run.
+         self._attach_session_title_callback(agent, ctx)
+@@ -1946,7 +2202,17 @@ class TurnRunner:
+         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+-        result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
++        bridge = getattr(self, "_desktop_bridge", None)
++        if bridge is not None:
++            bridge.session_id = str(getattr(agent, "session_id", None) or getattr(ctx, "session_id", None) or bridge.session_id)
++            bridge.on_turn_start()
++        try:
++            result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
++        finally:
++            if bridge is not None:
++                with suppress(Exception):
++                    bridge.on_turn_complete(locals().get("result") or {})
++                    bridge.close(timeout=1.5)
+         self._finish_stream_consumer(result, agent_history, stream_consumer)
+         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
+         # returns, so early run_sync returns are also finalised.
+diff --git a/hermes_cli/web_routers/dashboard_ui.py b/hermes_cli/web_routers/dashboard_ui.py
+index af5b6cb9f5..a895ac04fd 100644
+--- a/hermes_cli/web_routers/dashboard_ui.py
++++ b/hermes_cli/web_routers/dashboard_ui.py
+@@ -316,6 +316,39 @@ async def post_agent_plugin_activate(request: Request):
+     return await asyncio.to_thread(_run)
+ 
+ 
++@router.post("/api/dashboard/foreign-session-event")
++async def post_foreign_session_event(request: Request):
++    """Relay live stream/tool events from an external gateway process (``hermes gateway run``)
++    into connected Desktop WebSocket clients (patch 0010)."""
++    _require_token(request)
++    try:
++        body = await request.json()
++    except Exception:
++        body = {}
++    if not isinstance(body, dict):
++        return {"ok": False}
++    import sys
++    server = sys.modules.get("tui_gateway.server")
++    if server is None or not hasattr(server, "broadcast_foreign_session_event"):
++        return {"ok": False}
++    events = body.get("events")
++    if isinstance(events, list):
++        delivered = False
++        for item in events:
++            if isinstance(item, dict):
++                ev = str(item.get("event") or "").strip()
++                sid = str(item.get("session_id") or "").strip()
++                pl = item.get("payload") if isinstance(item.get("payload"), dict) else None
++                if ev and sid and server.broadcast_foreign_session_event(ev, sid, pl):
++                    delivered = True
++        return {"ok": True, "delivered": delivered}
++    ev = str(body.get("event") or "").strip()
++    sid = str(body.get("session_id") or "").strip()
++    pl = body.get("payload") if isinstance(body.get("payload"), dict) else None
++    delivered = bool(ev and sid and server.broadcast_foreign_session_event(ev, sid, pl))
++    return {"ok": True, "delivered": delivered}
++
++
+ @router.put("/api/dashboard/plugin-providers")
+ async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody,
+                                profile: Optional[str] = None):
+diff --git a/tests/tui_gateway/contracts/test_bridge_emit_contracts.py b/tests/tui_gateway/contracts/test_bridge_emit_contracts.py
+new file mode 100644
+index 0000000000..14cd3e8e10
+--- /dev/null
++++ b/tests/tui_gateway/contracts/test_bridge_emit_contracts.py
+@@ -0,0 +1,52 @@
++import os
++import pytest
++from gateway.run_turn_runner import _DesktopSessionEventBridge
++from tui_gateway.contracts import registry
++
++pytestmark = pytest.mark.skipif(
++    not os.environ.get("HERMES_TEST_ISOLATION"), reason="contract STRICT gate")
++
++
++def _probe() -> _DesktopSessionEventBridge:
++    b = _DesktopSessionEventBridge("")      # empty sid -> __init__ skips thread start; all attrs set
++    b.session_id = "probe"
++    b._thread = object()                    # emit() early-return guard satisfied
++    return b
++
++
++def test_all_bridge_emits_validate_under_strict():
++    assert registry.STRICT
++    b = _probe()
++    b.on_turn_start()
++    b.on_text_delta("hi"); b.on_reasoning_delta("think")
++    b.on_interim("note"); b.on_interim("note2", already_streamed=True)
++    b.on_tool_gen("terminal")
++    b.on_tool_start("c1", "terminal", {"command": "ls"})
++    b.on_tool_start("c2", "mcp__github__create_issue", {"title": "x"})
++    b.on_tool_start("c3", "connectors__gmail__send_email", "to=a@b.c")
++    b.on_tool_start("c4", "tool_call", {"calls": [{"name": "mcp__github__create_issue", "arguments": {"title": "x"}}]})
++    b.on_tool_complete("c1", "terminal", {"command": "ls"}, "ok")
++    b.on_tool_complete("c2", "mcp__github__create_issue", {"title": "x"}, '{"ok": true}')
++    b.on_tool_complete("c3", "connectors__gmail__stop", "to=a@b.c", {"raw": object()})
++    b.on_turn_complete({"final_response": "done"})
++    b.on_turn_complete({"failed": True, "error": "boom"})
++    b.on_turn_complete({"interrupted": True})
++    seen = [(it["event"], it["payload"]) for it in b._queue.queue]
++    assert len(seen) == 16
++    for event, payload in seen:
++        registry.check_payload(event, payload)   # STRICT -> raises on any violation
++    mcp_evt = next(p for e, p in seen if e == "tool.start" and p.get("name") == "mcp__github__create_issue")
++    assert mcp_evt["labels"] and mcp_evt["labels"][0]["kind"] == "mcp"
++    conn_evt = next(p for e, p in seen if e == "tool.start" and p.get("name") == "connectors__gmail__send_email")
++    assert conn_evt["labels"] and conn_evt["labels"][0]["kind"] == "connector"
++    bridged_evt = next(p for e, p in seen if e == "tool.start" and p.get("name") == "tool_call")
++    assert bridged_evt["labels"] and bridged_evt["labels"][0]["kind"] == "mcp"   # inner-call expansion
++    local_evt = next(p for e, p in seen if e == "tool.start" and p.get("name") == "terminal")
++    assert "labels" not in local_evt                                            # native-path parity
++
++
++def test_real_emit_raises_on_bad_payload_under_strict():
++    b = _probe()
++    with pytest.raises(registry.ContractViolation):
++        b.emit("tool.start", {"tool_id": "x", "name": "t",
++                              "labels": {"verb": "Running", "target": "y", " Past": "Running"}})
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index 0e4e8067ce..4fc2275797 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -192,6 +192,34 @@ def _session_db_content_sig(db_path: Path):
+     return signature
+ 
+ 
++_LIVE_PROFILE_HOMES_TTL_S = 30.0
++_live_profile_homes_cache: tuple[Path, int | None, float, tuple[Path, ...]] | None = None
++
++
++def _all_live_profile_homes() -> tuple[Path, ...]:
++    """Watcher home plus every live sibling profile home (cached on ``profiles/`` mtime + 30s TTL)
++    and any explicitly registered ``_served_profile_homes``."""
++    global _live_profile_homes_cache
++    home = _watcher_home()
++    profiles_dir = home / "profiles"
++    dir_mtime, now = _watcher_mtime_ns(profiles_dir), time.monotonic()
++    cached = _live_profile_homes_cache
++    if cached is not None and cached[0] == home and cached[1] == dir_mtime and now - cached[2] < _LIVE_PROFILE_HOMES_TTL_S:
++        discovered = cached[3]
++    else:
++        from hermes_constants import named_profile_is_live
++        homes: list[Path] = [home]
++        with contextlib.suppress(OSError):
++            for profile_dir in sorted(profiles_dir.iterdir()):
++                if named_profile_is_live(profile_dir):
++                    homes.append(profile_dir)
++        discovered = tuple(homes)
++        _live_profile_homes_cache = (home, dir_mtime, now, discovered)
++    seen = set(discovered)
++    extra = tuple(p for p in _served_profile_homes if p not in seen)
++    return (*discovered, *extra)
++
++
+ def _sessions_sig():
+     """Session-table content across the active and served profile stores.
+ 
+@@ -202,7 +230,7 @@ def _sessions_sig():
+     """
+     return tuple(
+         _session_db_content_sig(root / "state.db")
+-        for root in (_watcher_home(), *_served_profile_homes)
++        for root in _all_live_profile_homes()
+     )
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index d4934a257c..fb5ef2cc03 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -762,6 +762,44 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
+             logger.debug("global-event broadcast write failed type=%s", event, exc_info=True)
+ 
+ 
++def broadcast_foreign_session_event(event: str, session_id: str, payload: dict | None = None) -> bool:
++    """Broadcast a live stream/tool event from an external gateway process (e.g. ``hermes gateway run``
++    handling a Discord/Telegram turn) to connected Desktop WebSocket clients (patch 0010).
++
++    Also tracks ``_foreign_running`` on matching resumed records in ``_sessions`` so ``session.active_list``
++    reports ``status="working"`` while the external turn is in flight and Desktop's 1.5s liveness poll
++    does not prematurely settle the streamed bubble.
++    """
++    sid_str = str(session_id or "").strip()
++    if not sid_str or not event:
++        return False
++    now = time.time()
++    matched_sids: list[str] = []
++    with _sessions_lock:
++        for rsid, sess in list(_sessions.items()):
++            if not isinstance(sess, dict) or sess.get("_finalized"):
++                continue
++            if _session_lookup_key(sess, fallback=rsid) == sid_str or rsid == sid_str:
++                matched_sids.append(rsid)
++                sess["last_active"] = now
++                if event in ("message.start", "reasoning.delta", "message.delta", "tool.start", "tool.generating"):
++                    sess["_foreign_running"] = True
++                    sess["_foreign_running_ts"] = now
++                elif event in ("message.complete", "error"):
++                    sess["_foreign_running"] = False
++    with _live_transports_lock:
++        targets = list(_live_transports)
++    if not targets:
++        return False
++    emit_ids = matched_sids or [sid_str]
++    for target_sid in emit_ids:
++        frame = _event_frame(event, target_sid, payload)
++        for transport in targets:
++            with contextlib.suppress(Exception):
++                transport.write(frame)
++    return True
++
++
+ def _approval_request_payload(data: dict | None) -> dict:
+     """Build the client-safe representation of a pending approval."""
+     payload = dict(data or {})
+@@ -3049,7 +3087,12 @@ def _session_live_status(sid: str, session: dict) -> str:
+     # Unset + build never started = a lazy watch session idling, not one stuck mid-construction.
+     if ready is not None and not ready.is_set() and session.get("agent_build_started"):
+         return "starting"
+-    return "working" if session.get("running") else "idle"
++    if session.get("running"):
++        return "working"
++    # Patch 0010: foreign gateway turn running for this resumed session.
++    if session.get("_foreign_running") and (time.time() - float(session.get("_foreign_running_ts") or 0)) < 600.0:
++        return "working"
++    return "idle"
+ 
+ 
+ def _session_live_title(session: dict, key: str) -> str:

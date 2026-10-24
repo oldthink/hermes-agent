@@ -1,0 +1,136 @@
+diff --git a/apps/desktop/src/components/model-picker.tsx b/apps/desktop/src/components/model-picker.tsx
+index c993cb0f47..2ddb88008b 100644
+--- a/apps/desktop/src/components/model-picker.tsx
++++ b/apps/desktop/src/components/model-picker.tsx
+@@ -356,6 +356,7 @@ function ModelResults({
+             )}
+             {models.map(model => {
+               const isCurrent = model === currentModel && catalogProviderMatches(provider, currentProvider)
++              const label = provider.model_labels?.[model]
+               const price = provider.pricing?.[model]
+               const locked = unavailable.has(model)
+               const resetMs = modelResetMs(provider, model)
+@@ -384,7 +385,11 @@ function ModelResults({
+                   value={`${provider.slug}:${model}`}
+                 >
+                   <span className={cn('min-w-0 flex-1 truncate', dimmed && !isCurrent && 'text-muted-foreground')}>
+-                    <HighlightMatches foldSeparators query={search} text={model} />
++                    {provider.model_labels?.[model] ? (
++                      <span title={model}>{provider.model_labels[model]}</span>
++                    ) : (
++                      <HighlightMatches foldSeparators query={search} text={model} />
++                    )}
+                   </span>
+                   {loadProgress && (
+                     <span className="flex shrink-0 items-center gap-1.5" title={copy.loadingIntoMemory}>
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 3c7b1b5b47..268e303b80 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -788,6 +788,7 @@ export interface ModelOptionProvider {
+   slug: string
+   name: string
+   models?: string[]
++  model_labels?: Record<string, string> | null
+   total_models?: number | null
+   is_current?: boolean | null
+   is_user_defined?: boolean | null
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index fe5067d62a..c10dd42667 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -19385,6 +19385,21 @@
+             "title": "Models",
+             "type": "array"
+           },
++          "model_labels": {
++            "anyOf": [
++              {
++                "additionalProperties": {
++                  "type": "string"
++                },
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Model Labels"
++          },
+           "total_models": {
+             "anyOf": [
+               {
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 2175b781e8..52a6040eda 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -161,6 +161,7 @@ def build_models_payload(
+     if featured:
+         _apply_featured(rows, metadata_config=metadata_config)
+     _apply_custom_aliases(rows)
++    _apply_model_labels(rows)
+     from hermes_cli.models_validate import drop_unofferable_model_ids
+ 
+     drop_unofferable_model_ids(rows)
+@@ -643,6 +644,48 @@ def _apply_featured(rows: list[dict], *, metadata_config: dict | None = None) ->
+         row["featured_models"] = sorted(featured, key=lambda m: order[m])
+ 
+ 
++def _apply_model_labels(rows: list[dict]) -> None:
++    """Attach per-model display labels from ``model_labels.<provider>.<model>`` in config.yaml.
++
++    A model id stays the wire truth (routing, pricing, switching all key off it); the label is
++    display-only and exists because some ids are ambiguous to a human — e.g. the same
++    ``google/gemini-4-argon`` id serves both a flex (half-price) and a standard OpenRouter
++    endpoint, selected by ``provider_routing``, so the id alone cannot tell an operator which
++    rate they are picking. Shape: ``{"openrouter": {"<model id>": "<label>"}}``; providers
++    absent from the map keep raw ids.
++    """
++    try:
++        from hermes_cli.config import load_config_readonly
++
++        labels = load_config_readonly().get("model_labels") or {}
++    except Exception:  # noqa: BLE001 — a label map must never fail the catalog payload
++        return
++    if not isinstance(labels, dict) or not labels:
++        return
++    for row in rows:
++        slug = str(row.get("slug") or "")
++        entry = labels.get(slug) or labels.get(slug.lower())
++        if not isinstance(entry, dict) or not entry:
++            continue
++        label_map = {str(k): str(v) for k, v in entry.items() if str(k).strip() and str(v).strip()}
++        if not label_map:
++            continue
++        row["model_labels"] = label_map
++        # A labelled model is one the operator wants to SEE. OpenRouter's curated index rotates,
++        # so an id can be temporarily absent even though the endpoint serves it; inject it so the
++        # label never has a row to attach to. The id is still validated downstream
++        # (drop_unofferable_model_ids) — injection must not smuggle a malformed id past it.
++        models = row.get("models")
++        if isinstance(models, list):
++            have = {str(m).lower() for m in models}
++            extra = [mid for mid in label_map if mid.lower() not in have]
++            if extra:
++                row["models"] = [*models, *extra]
++                total = row.get("total_models")
++                if isinstance(total, int):
++                    row["total_models"] = total + len(extra)
++
++
+ def _apply_custom_aliases(rows: list[dict]) -> None:
+     """Attach the accepted identity set to each user-defined row: ``model.options`` reports the canonical
+     ``custom:<key>`` while rows carry the bare key as ``slug``, so GUI exact-match never finds the row.
+diff --git a/tui_gateway/contracts/config_free_tier_control.py b/tui_gateway/contracts/config_free_tier_control.py
+index ba3909445a..2d85231b46 100644
+--- a/tui_gateway/contracts/config_free_tier_control.py
++++ b/tui_gateway/contracts/config_free_tier_control.py
+@@ -540,6 +540,7 @@ class ModelOptionProvider(OpenModel):
+     slug: str
+     name: str
+     models: list[str] = Field(default_factory=list)
++    model_labels: dict[str, str] | None = None
+     total_models: int | None = None
+     is_current: bool | None = None
+     is_user_defined: bool | None = None

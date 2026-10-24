@@ -1,0 +1,656 @@
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 5564047073..74f5fad183 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -176,6 +176,37 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
+ _DESKTOP_MCP_DISCOVERY_DELAY_S = 1.0
+ 
+ 
++def _recover_served_profile_process_checkpoints(process_registry) -> int:
++    """Replay every served profile's ``processes.json`` under its own scope.
++
++    Mirrors the multiplex gateway's ``_recover_secondary_process_checkpoints``
++    (gateway/run_startup.py): the launch profile's file is read first by
++    ``recover_from_checkpoint``, and a served secondary's checkpoint must be
++    re-read under that profile's scope or its background processes are never
++    re-adopted after a backend respawn.
++    """
++    try:
++        from hermes_cli.profiles import profiles_to_serve
++        from hermes_constants import get_hermes_home
++
++        launch_home = Path(get_hermes_home()).resolve()
++    except Exception:
++        _log.debug("served-profile checkpoint enumeration unavailable", exc_info=True)
++        return 0
++    recovered = 0
++    for _name, profile_home in profiles_to_serve(multiplex=True):
++        if Path(profile_home).resolve() == launch_home:
++            continue
++        try:
++            from gateway.run import _profile_runtime_scope
++
++            with _profile_runtime_scope(Path(profile_home), {}):
++                recovered += process_registry.recover_from_checkpoint()
++        except Exception:
++            _log.warning("Process checkpoint recovery for profile %r failed", _name, exc_info=True)
++    return recovered
++
++
+ @asynccontextmanager
+ async def _lifespan(app: "FastAPI"):
+     app.state.event_channels = {}  # dict[str, set]
+@@ -220,6 +251,29 @@ async def _lifespan(app: "FastAPI"):
+     from tui_gateway import methods_groups as _hosted_groups
+     import tui_gateway.server  # noqa: F401
+ 
++    # Process-checkpoint recovery (the registry's reader threads died with the
++    # previous backend exit): without this, every background process spawned by
++    # a desktop/serve session is orphaned across a backend respawn — its exit
++    # then produces neither a process-results receipt nor a completion wake
++    # (silent-notify-drop class; see t_695b4b52 evidence). ``gateway run`` does
++    # this at startup (run_startup._start_recover_previous_run); a serve
++    # backend owns the same registry, so it must do the same. Off-thread so a
++    # contended processes.json never delays the socket; best-effort, never fatal.
++    def _recover_process_checkpoint() -> None:
++        try:
++            from tools.process_registry import process_registry
++
++            recovered = process_registry.recover_from_checkpoint()
++            recovered += _recover_served_profile_process_checkpoints(process_registry)
++            if recovered:
++                _log.info("Recovered %s background process(es) from previous backend run", recovered)
++        except Exception:
++            _log.warning("Process checkpoint recovery failed at backend startup", exc_info=True)
++
++    threading.Thread(target=_recover_process_checkpoint, daemon=True,
++                     name="process-checkpoint-recovery").start()
++
++
+     try:
+         tui_gateway.server.install_tui_message_injector()
+     except Exception:
+diff --git a/tests/tools/test_process_recovery_notify_drop.py b/tests/tools/test_process_recovery_notify_drop.py
+new file mode 100644
+index 0000000000..df4b230ffc
+--- /dev/null
++++ b/tests/tools/test_process_recovery_notify_drop.py
+@@ -0,0 +1,265 @@
++"""t_695b4b52 — silent notify drops when the registry's owner process dies.
++
++Covers the three fixes:
++  1. ``save_completed_result`` never raises out of ``_move_to_finished``
++     (deliberately-undeliverable receipt = failure control; the wake must
++     still be queued).
++  2. A checkpointed notify-on-complete child whose PID is already gone at
++     recovery time gets a receipt + completion wake (previously: silently
++     pruned — THE reported bug).
++  3. A recovered ALIVE child gets its exit observed by the detached sweeper
++     even with no gateway watcher loop (serve/desktop backend shape).
++  4. The serve-backend lifespan runs checkpoint recovery (unit-level: the
++     helper exists and the recovery thread is spawned).
++"""
++
++import json
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++
++@pytest.fixture()
++def registry():
++    return ProcessRegistry()
++
++
++def _checkpoint_entry(session_id, pid, *, notify=True, started=None, command="sleep 5"):
++    return {
++        "session_id": session_id,
++        "command": command,
++        "pid": pid,
++        "pid_scope": "host",
++        "host_start_time": None,
++        "systemd_unit": "",
++        "cwd": "/tmp",
++        "started_at": started if started is not None else time.time(),
++        "task_id": "t1",
++        "owner_task_id": "t1",
++        "session_key": "chat-1",
++        "notify_on_complete": notify,
++        "watcher_interval": 0,
++        "parent_session_id": "owner-session",
++        "persist_on_release": True,
++    }
++
++
++# ── 1. Receipt failure must never take the wake with it ─────────────────────
++
++
++def test_undeliverable_receipt_still_queues_wake(registry, tmp_path, monkeypatch):
++    """Failure control: an unwritable process-results dir (non-OSError path
++    included) logs and keeps delivery alive; the completion event is queued."""
++    def _boom(session):
++        raise ValueError("deliberately undeliverable receipt (failure control)")
++
++    # process_registry imported the symbol into its own namespace at module load.
++    monkeypatch.setattr("tools.process_registry.save_completed_result", _boom)
++
++    s = ProcessSession(
++        id="proc_undeliverable01", command="echo x", task_id="t1",
++        started_at=time.time(), notify_on_complete=True,
++    )
++    s.exited = True
++    s.exit_code = 0
++    registry._running[s.id] = s
++    with patch.object(registry, "_write_checkpoint"):
++        registry._move_to_finished(s)
++
++    assert registry.completion_queue.qsize() == 1
++    evt = registry.completion_queue.get_nowait()
++    assert evt["type"] == "completion"
++    assert evt["session_id"] == "proc_undeliverable01"
++
++
++def test_save_completed_result_swallows_non_oserror(monkeypatch, tmp_path):
++    """Direct unit: ValueError inside save_completed_result's write path is
++    logged, not raised (the module's own try now catches Exception)."""
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++    from tools import process_registry_results as receipts
++
++    token = set_hermes_home_override(tmp_path)
++    try:
++        s = ProcessSession(
++            id="proc_receiptraise001", command="echo x", task_id="t1",
++            started_at=time.time(), exited=True, exit_code=3,
++        )
++        # The module calls utils.atomic_json_write by its imported name.
++        with patch("tools.process_registry_results.atomic_json_write",
++                   side_effect=ValueError("surrogate!")):
++            receipts.save_completed_result(s)  # must not raise
++        assert not (tmp_path / "logs" / "process-results" / f"{s.id}.json").exists()
++    finally:
++        reset_hermes_home_override(token)
++
++
++# ── 2. Recovery-time unobserved exit: receipt + wake ────────────────────────
++
++
++def test_recovery_publishes_unobserved_exit_for_notify_child(registry, tmp_path, monkeypatch):
++    """The reported bug: child dies while its owner process is gone; the
++    successor's recovery sees a dead PID and used to prune silently. Now it
++    writes the receipt and queues the completion."""
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++    token = set_hermes_home_override(tmp_path)
++    try:
++        checkpoint = tmp_path / "processes.json"
++        # A PID that is provably dead: spawn and reap a real short-lived process.
++        import subprocess, sys, os
++        dead = subprocess.Popen([sys.executable, "-c", "pass"])
++        dead.wait()
++        entry = _checkpoint_entry("proc_deadnotify0001", dead.pid)
++        checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
++
++        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
++            recovered = registry.recover_from_checkpoint()
++
++        assert recovered == 0  # not adopted as running — it is dead
++        receipt = tmp_path / "logs" / "process-results" / "proc_deadnotify0001.json"
++        assert receipt.exists(), "unobserved exit must leave a durable receipt"
++        record = json.loads(receipt.read_text(encoding="utf-8"))
++        assert record["notify_on_complete"] is True
++        assert record["termination_source"] == "recovery_unobserved"
++        assert registry.completion_queue.qsize() == 1
++        evt = registry.completion_queue.get_nowait()
++        assert evt["type"] == "completion"
++        assert evt["session_id"] == "proc_deadnotify0001"
++        assert evt["exit_code"] is None
++        assert "unobserved" in evt["note"].lower()
++    finally:
++        reset_hermes_home_override(token)
++
++
++def test_recovery_silent_child_stays_silent(registry, tmp_path):
++    """notify_on_complete absent → no receipt, no wake (a silent server/watcher
++    must not fabricate completions)."""
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++    token = set_hermes_home_override(tmp_path)
++    try:
++        import subprocess, sys
++        dead = subprocess.Popen([sys.executable, "-c", "pass"])
++        dead.wait()
++        checkpoint = tmp_path / "processes.json"
++        entry = _checkpoint_entry("proc_deadsilent0001", dead.pid, notify=False)
++        checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
++
++        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
++            registry.recover_from_checkpoint()
++
++        assert not (tmp_path / "logs" / "process-results" / "proc_deadsilent0001.json").exists()
++        assert registry.completion_queue.empty()
++    finally:
++        reset_hermes_home_override(token)
++
++
++def test_recovery_skips_when_receipt_already_exists(registry, tmp_path):
++    """An exit observed before the owner died already has its receipt; recovery
++    must not fabricate an unknown-code duplicate wake."""
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++    token = set_hermes_home_override(tmp_path)
++    try:
++        import subprocess, sys
++        dead = subprocess.Popen([sys.executable, "-c", "pass"])
++        dead.wait()
++        session_id = "proc_observedexit001"
++        results = tmp_path / "logs" / "process-results"
++        results.mkdir(parents=True, exist_ok=True)
++        (results / f"{session_id}.json").write_text("{}", encoding="utf-8")
++
++        checkpoint = tmp_path / "processes.json"
++        entry = _checkpoint_entry(session_id, dead.pid)
++        checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
++
++        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
++            registry.recover_from_checkpoint()
++
++        assert registry.completion_queue.empty()
++        assert json.loads((results / f"{session_id}.json").read_text()) == {}
++    finally:
++        reset_hermes_home_override(token)
++
++
++# ── 3. Alive recovered child: the sweeper observes its exit ─────────────────
++
++
++def test_detached_sweeper_publishes_exit_without_gateway_watcher(registry, tmp_path):
++    """Serve-backend shape: recovered ALIVE child, no watcher loop anywhere.
++    The detached sweeper must notice the PID's death and publish receipt+wake."""
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++    token = set_hermes_home_override(tmp_path)
++    try:
++        import subprocess, sys
++        child = subprocess.Popen(
++            [sys.executable, "-c", "import time; time.sleep(30)"])
++        checkpoint = tmp_path / "processes.json"
++        entry = _checkpoint_entry("proc_aliverecover001", child.pid)
++        checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
++
++        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
++            recovered = registry.recover_from_checkpoint()
++        assert recovered == 1
++        assert registry._detached_sweeper_thread is not None
++
++        child.kill()
++        child.wait()
++        # Drive the sweeper synchronously instead of sleeping a full cadence.
++        registry._sweep_detached_once()
++
++        receipt = tmp_path / "logs" / "process-results" / "proc_aliverecover001.json"
++        assert receipt.exists()
++        assert registry.completion_queue.qsize() == 1
++        evt = registry.completion_queue.get_nowait()
++        assert evt["session_id"] == "proc_aliverecover001"
++        assert evt["exit_code"] is None
++        assert evt["termination_source"] == "recovery_unobserved"
++    finally:
++        reset_hermes_home_override(token)
++
++
++def test_detached_sweeper_leaves_running_child_alone(registry, tmp_path):
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++    token = set_hermes_home_override(tmp_path)
++    try:
++        import subprocess, sys
++        child = subprocess.Popen(
++            [sys.executable, "-c", "import time; time.sleep(30)"])
++        try:
++            checkpoint = tmp_path / "processes.json"
++            entry = _checkpoint_entry("proc_stillrunning001", child.pid)
++            checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
++            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
++                registry.recover_from_checkpoint()
++            registry._sweep_detached_once()
++            assert registry.completion_queue.empty()
++            assert registry.get("proc_stillrunning001") is not None
++        finally:
++            child.kill()
++            child.wait()
++    finally:
++        reset_hermes_home_override(token)
++
++
++# ── 4. Serve-backend lifespan runs recovery ─────────────────────────────────
++
++
++def test_serve_lifespan_declares_checkpoint_recovery():
++    """The recovery call is wired in web_server._lifespan (source-level guard:
++    the exact regression — serve backends never recovering — must not return)."""
++    import hermes_cli.web_server as ws
++    import inspect
++
++    src = inspect.getsource(ws._lifespan)
++    assert "recover_from_checkpoint" in src, (
++        "serve-backend lifespan must recover the process checkpoint; without it "
++        "every background child of a desktop session is orphaned across a "
++        "backend respawn (silent notify drop)")
++    assert callable(ws._recover_served_profile_process_checkpoints)
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index b64e0b1d2c..24c1988494 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -87,6 +87,10 @@ HEARTBEAT_TICK_SECONDS = 5
+ # Reader final drain after a reconcile saw the direct child exit: the exited child's unread tail is at
+ # most one pipe buffer (Linux pipe-max-size default 1 MiB), and the reader publishes within one select
+ # interval plus that drain.
++# Detached (checkpoint-recovered) session sweep cadence: no reader thread exists, so the sweeper
++# thread is the only exit observer for recovered children (serve/desktop backends have no gateway
++# watcher loop). 5s matches the gateway watcher interval.
++DETACHED_SWEEP_SECONDS = 5
+ _FINAL_DRAIN_MAX_CHARS = 1 << 20
+ _READER_FINAL_DRAIN_WAIT_SECONDS = 1.0
+ # Global circuit breaker across all sessions so concurrent siblings can't collectively
+@@ -743,6 +747,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
+         self.on_output = None
+         self.on_close = None
+         self._heartbeat_thread: Optional[threading.Thread] = None
++        self._detached_sweeper_thread: Optional[threading.Thread] = None
+ 
+     # ── heartbeat ───────────────────────────────────────────────────────────
+     def arm_heartbeat(self, session: ProcessSession, seconds: int) -> int:
+@@ -764,6 +769,105 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
+                 target=self._heartbeat_loop, name="process-heartbeat", daemon=True)
+             self._heartbeat_thread.start()
+ 
++    # Detached (checkpoint-recovered) sessions have no reader thread: only this
++    # sweeper observes their exit. A serve/desktop backend owns recovered
++    # sessions with no gateway watcher loop, so without the sweep an adopted
++    # child's exit is as silent as an unadopted one (t_695b4b52).
++    def _ensure_detached_sweeper(self) -> None:
++        with self._lock:
++            if self._detached_sweeper_thread is not None and self._detached_sweeper_thread.is_alive():
++                return
++            self._detached_sweeper_thread = threading.Thread(
++                target=self._detached_sweeper_loop, name="process-detached-sweeper", daemon=True)
++            self._detached_sweeper_thread.start()
++
++    def _detached_sweeper_loop(self) -> None:
++        """Watch recovered host-PID sessions; publish their unobserved exits."""
++        while True:
++            time.sleep(DETACHED_SWEEP_SECONDS)
++            try:
++                self._sweep_detached_once()
++            except Exception:
++                logger.debug("Detached-session sweep failed", exc_info=True)
++
++    def _sweep_detached_once(self) -> None:
++        with self._lock:
++            candidates = [s for s in self._running.values()
++                          if s.detached and not s.exited and s.pid_scope == "host"]
++        for session in candidates:
++            fate = self._detached_host_fate(session.pid, session.host_start_time)
++            if fate == "running":
++                continue
++            # Claim the exit exactly once, under the session lock a racing
++            # kill_process on the same detached session also honours.
++            with session._lock:
++                if session.exited:
++                    continue
++                session.exited = True
++                if fate == "reused":
++                    session.completion_reason = "exited"
++                    session.termination_source = "pid_reused"
++                else:
++                    session.completion_reason = "exited"
++                    session.termination_source = "recovery_unobserved"
++            if fate == "reused":
++                # The number belongs to a stranger: no receipt, no completion —
++                # no exit status was ever collected for OUR process.
++                with self._lock:
++                    self._running.pop(session.id, None)
++                    self._finished[session.id] = session
++                self._write_checkpoint()
++                session._completion_event.set()
++                logger.info(
++                    "Detached session %s closed: pid %s was recycled onto another process",
++                    session.id, session.pid)
++                continue
++            self._finish_uncollected_detached(session)
++
++    def _finish_uncollected_detached(self, session: ProcessSession) -> None:
++        """Retire a recovered session whose PID died unobserved: receipt + wake."""
++        if session.notify_on_complete:
++            self._emit_uncollected_exit(session)
++        with self._lock:
++            session.exited_at = session.exited_at or time.time()
++            self._running.pop(session.id, None)
++            if session.systemd_unit:
++                self._finished[session.id] = session
++        self._write_checkpoint()
++        session._completion_event.set()
++
++    def _emit_uncollected_exit(self, session: ProcessSession) -> None:
++        """Durable receipt + queued completion for an exit nobody observed (owner
++        process died before the child). Exit code unknown by construction; the
++        note tells the consumer why. Shared by recovery-time and sweep-time."""
++        from tools.process_registry_results import save_completed_result
++
++        try:
++            save_completed_result(session)
++        except Exception:
++            logger.warning("Uncollected-exit receipt for %s failed", session.id, exc_info=True)
++        notification = {
++            "type": "completion", "session_id": session.id,
++            "session_key": session.session_key,
++            "task_id": session.task_id, "owner_task_id": session.owner_task_id,
++            "command": session.command,
++            "exit_code": None,
++            "completion_reason": session.completion_reason,
++            "termination_source": session.termination_source or "recovery_unobserved",
++            "started_at": session.started_at,
++            "exited_at": session.exited_at or 0.0,
++            "note": "Exit unobserved: the owning Hermes process was gone when this "
++                    "process finished, so no exit status was collected. If the exit "
++                    "code matters, check the process's own output file/logs.",
++            **_completion_output(session),
++        }
++        _redact_process_result(notification)
++        self.completion_queue.put(notification)
++        logger.warning(
++            "Published unobserved completion for recovered process %s (owner died "
++            "before exit; exit code unknown; receipt + wake delivered)",
++            session.id)
++
+     def _heartbeat_loop(self) -> None:
+         """One daemon thread for every heartbeat session: reader threads block on the pipe and
+         cannot keep time, and a per-process timer would leak one thread per job."""
+@@ -1601,7 +1705,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
+                 session.exited_at = time.time()
+                 # Keep the session tracked until its result is durable. A finite
+                 # parent must not observe completion and exit during this write.
+-                save_completed_result(session)
++                try:
++                    save_completed_result(session)
++                except Exception:
++                    # The receipt is best-effort; the wake is the deliverable. Any
++                    # failure here (non-OSError included) must not kill the reader
++                    # thread holding this lock or drop the completion event.
++                    logger.warning(
++                        "Could not retain completed process result %s", session.id, exc_info=True)
+                 self._running.pop(session.id)
+             self._finished[session.id] = session
+         # Release the retained Popen/PTY handles now: otherwise every
+@@ -1645,6 +1756,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
+             }
+             _redact_process_result(notification)
+             self.completion_queue.put(notification)
++            # Audit line (t_695b4b52): the completion event exists the moment it is
++            # queued — an operator grepping logs for a lost wake can tie queue →
++            # receipt → consumer, and a missing receipt with this line present
++            # indicts save_completed_result, not the notify path.
++            logger.info(
++                "Queued completion notification for %s (exit=%s reason=%s notify=%s "
++                "receipt=%s)",
++                session.id, session.exit_code, session.completion_reason,
++                session.notify_on_complete,
++                (get_hermes_home() / "logs" / "process-results" / f"{session.id}.json").exists(),
++            )
+ 
+     @staticmethod
+     def _exit_fields(session: ProcessSession) -> dict:
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 7a45491342..be74381f00 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -15,6 +15,60 @@ class ProcessCheckpointMixin:
+         """Subclass supplies the live PID decision. See ProcessRegistry."""
+         raise NotImplementedError
+ 
++    def _ensure_detached_sweeper(self) -> None:
++        """Subclass starts the recovered-session exit sweeper. See ProcessRegistry."""
++        raise NotImplementedError
++
++    def _emit_uncollected_exit(self, session) -> None:
++        """Subclass persists the receipt and queues the completion. See ProcessRegistry."""
++        raise NotImplementedError
++
++    # ``completion_queue`` is an instance attribute supplied by the subclass
++    # (ProcessRegistry.__init__); the mixin only requires it exists.
++
++    def _publish_uncollected_recovery_exit(self, entry: Dict[str, Any]) -> None:
++        """Report a checkpointed child whose exit nobody observed.
++
++        The owning process (CLI/serve backend) died before the child did, and
++        the successor never re-adopted it — so no reader thread ran
++        ``_move_to_finished``: no process-results receipt, no completion wake
++        (silent-notify-drop class). Only sessions that asked to be notified
++        (``notify_on_complete``) are reported; a silent server/watcher stays
++        silent. The exit code is unknown — the status was never collected —
++        unless a receipt from an observed exit already exists, in which case
++        that receipt was written by a live owner and nothing was lost: skip.
++
++        Receipt + queue live in ProcessRegistry._emit_uncollected_exit (shared
++        with the detached sweeper); this method only builds the session.
++        """
++        session_id = str(entry.get("session_id") or "")
++        if not session_id or not entry.get("notify_on_complete"):
++            return
++        from tools.process_registry import ProcessSession
++        from tools.process_registry_results import _result_paths
++
++        # An existing receipt proves the exit WAS observed and retained before
++        # the owner died; re-publishing would fabricate an unknown-code exit.
++        if any(path.stem == session_id for path in _result_paths()):
++            logger.info(
++                "Recovered process %s already has a retained result; exit was observed", session_id)
++            return
++        session = ProcessSession(
++            id=session_id, command=entry.get("command", "unknown"),
++            task_id=entry.get("task_id", ""), owner_task_id=entry.get("owner_task_id", ""),
++            session_key=entry.get("session_key", ""),
++            started_at=float(entry.get("started_at") or 0.0),
++            parent_session_id=entry.get("parent_session_id", ""), detached=True,
++            notify_on_complete=True,
++        )
++        with session._lock:
++            session.exited = True
++            session.exit_code = None
++            session.completion_reason = "exited"
++            session.termination_source = "recovery_unobserved"
++        self._emit_uncollected_exit(session)
++
++
+     # ----- Checkpoint (crash recovery) -----
+ 
+     def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
+@@ -100,6 +154,13 @@ class ProcessCheckpointMixin:
+                         "retaining checkpoint entry for the next startup",
+                         systemd_unit, pid)
+                     unresolved_scope_entries.append(entry)
++                    continue
++                # A notify-on-complete child that died while its owner process was
++                # gone exits unobserved: no reader thread ever ran _move_to_finished,
++                # so neither the durable receipt nor the completion wake exists.
++                # Publish a recovery-sourced completion so the exit is at least
++                # reported (exit code unknown — the status was never collected).
++                self._publish_uncollected_recovery_exit(entry)
+                 continue
+             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+             fields.update(
+@@ -110,6 +171,10 @@ class ProcessCheckpointMixin:
+             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+             with self._lock:
+                 self._running[session.id] = session
++            # Recovered children have no reader thread: start the detached sweeper so
++            # their eventual exit is observed (receipt + wake) even in a serve backend
++            # with no gateway watcher loop (t_695b4b52).
++            self._ensure_detached_sweeper()
+             recovered += 1
+             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+             # Re-enqueue watcher so gateway can resume notifications
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index a1489c6c29..587f20a6b8 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -368,13 +368,16 @@ def process_completion_display_text(events: list) -> str:
+         return f"{len(events)} Background Processes Finished"
+     evt = events[0]
+     reason, exit_code = evt.get("completion_reason") or "exited", evt.get("exit_code", "?")
++    cmd = _short_command(evt.get("command"))
++    if exit_code is None:
++        # Unobserved exit (recovery-sourced): "Failed" would be a fabrication.
++        return f"Background Process Ended Unobserved: {cmd}" if cmd else "Background Process Ended Unobserved"
+     if reason == "killed":
+         outcome = "Terminated"
+     elif reason in _REASON_STATUS:
+         outcome = "Lost" if reason == "lost" else "Failed to Start"
+     else:
+         outcome = "Finished" if exit_code == 0 else "Failed"
+-    cmd = _short_command(evt.get("command"))
+     detail = f" (exit {exit_code})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
+     return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
+ 
+@@ -466,6 +469,9 @@ def format_process_notification(evt: dict) -> "str | None":
+             f"{attribution}Command: {_cmd}\nMatched output:\n{evt.get('output', '')}"
+             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
+     _exit = evt.get("exit_code", "?")
++    if _exit is None:
++        # Recovery-sourced unobserved exit (t_695b4b52): no status was collected.
++        _exit = "unknown (owner process was gone at exit)"
+     _out = evt.get("output", "")
+     _signal = ", SIGTERM" if _exit in {-15, 143, "-15", "143"} else ""
+     # A subagent-owned process's full output belongs in the child's transcript, not as
+@@ -479,7 +485,9 @@ def format_process_notification(evt: dict) -> "str | None":
+         # Say so where the output is the payload (a teammate's reply): a silent tail reads as whole.
+         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
+                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
++    _note = f"{evt['note']}\n" if evt.get("note") else ""
+     return (
+         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
+         f"{_completion_age_banner(evt)}"
++        f"{_note}"
+         f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index d7ba9cf52d..ef3a519843 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -62,8 +62,12 @@ def save_completed_result(session) -> None:
+         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+         atomic_json_write(directory / f"{session.id}.json", record, mode=0o600)
+         _result_paths()
+-    except OSError:
++    except Exception:
+         # Preserve live delivery on disk failure, but never silently claim durability.
++        # Exception, not OSError: this runs inside _move_to_finished's registry lock —
++        # anything else (a lone surrogate before the json fallback, a profile guard
++        # raising non-OSError) would kill the reader thread holding the lock, wedging
++        # the whole registry and dropping the completion wake with the receipt.
+         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+ 
+ 

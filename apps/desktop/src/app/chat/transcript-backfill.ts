@@ -294,6 +294,25 @@ interface StoredRowSlot {
   leading: ChatMessage[]
 }
 
+/** A message's durable logical ids: its own `messageUid` and the final-row uid a
+ * terminal-frame receipt proved. Empty on rows from backends/legs that carry
+ * neither — uid matching then simply never fires. */
+function messageUidKeys(message: ChatMessage): string[] {
+  const uids: string[] = []
+
+  if (typeof message.messageUid === 'string' && message.messageUid) {
+    uids.push(message.messageUid)
+  }
+
+  const receiptUid = message.persistedTurn?.message_uid
+
+  if (typeof receiptUid === 'string' && receiptUid && !uids.includes(receiptUid)) {
+    uids.push(receiptUid)
+  }
+
+  return uids
+}
+
 /**
  * Stored-id merge for a page that overlaps the window but does not anchor in
  * front of it. A row with no stored id travels with the next stored row after
@@ -318,6 +337,31 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
 
   const byRowId = new Map<number, StoredRowSlot>()
 
+  // uid → the fresh page's message carrying that durable logical id. Built from
+  // the refreshed tail BEFORE placing either side, so a local row can find its
+  // canonical twin even when no physical row id is shared.
+  const refreshedByUid = new Map<string, ChatMessage>()
+
+  for (const message of refreshedTail) {
+    for (const uid of messageUidKeys(message)) {
+      if (!refreshedByUid.has(uid)) {
+        refreshedByUid.set(uid, message)
+      }
+    }
+  }
+
+  const findByUid = (message: ChatMessage): ChatMessage | undefined => {
+    for (const uid of messageUidKeys(message)) {
+      const hit = refreshedByUid.get(uid)
+
+      if (hit !== undefined) {
+        return hit
+      }
+    }
+
+    return undefined
+  }
+
   const place = (messages: ChatMessage[], fresh: boolean): ChatMessage[] => {
     let pending: ChatMessage[] = []
 
@@ -325,10 +369,14 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
       const sourceIds = transcriptRowIds(message)
       const folded = sourceIds.length ? refreshedBySource.get(sourceIds[0]) : undefined
 
-      // A completed live reply is addressed by its final row; hydration can
-      // fold that row into an earlier tool bubble. Give both the fold's slot,
-      // so the fresh copy replaces the live one without losing its leading rows.
-      // Partial/live bubbles may still hold an uncommitted suffix.
+      // Durable logical identity (message_uid): the settled streamed bubble of a
+      // turn the FOREIGN bridge carried (patch 0010) has no row the page knows —
+      // its uid, stamped from the terminal frame's receipt, is the one key it
+      // shares with the canonical hydrated row. A uid match IS the fold: the
+      // fresh page's copy replaces the local one instead of riding along as a
+      // trailing duplicate bubble (2026-10-22 duplicate-bubble report).
+      const uidFolded = folded === undefined ? findByUid(message) : folded
+
       const covered =
         !fresh &&
         !message.pending &&
@@ -336,10 +384,10 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
         !message.error &&
         message.durableComplete !== false &&
         message.persistedTurn?.complete !== false &&
-        folded?.role === message.role &&
-        sourceIds.every(id => refreshedBySource.get(id) === folded)
+        (folded?.role === message.role || (folded === undefined && uidFolded?.role === message.role)) &&
+        (sourceIds.every(id => refreshedBySource.get(id) === folded) || (folded === undefined && uidFolded !== undefined))
 
-      const rowId = covered ? (folded?.rowId ?? message.rowId) : message.rowId
+      const rowId = covered ? (folded?.rowId ?? uidFolded?.rowId ?? message.rowId) : message.rowId
 
       if (rowId === undefined) {
         // The fresh page's copy of an unstored row wins over the window's.

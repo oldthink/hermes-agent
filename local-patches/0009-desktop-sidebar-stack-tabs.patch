@@ -1,0 +1,13 @@
+diff --git a/apps/desktop/src/app/contrib/wiring.tsx b/apps/desktop/src/app/contrib/wiring.tsx
+index 35ba636524..46c44bd61d 100644
+--- a/apps/desktop/src/app/contrib/wiring.tsx
++++ b/apps/desktop/src/app/contrib/wiring.tsx
+@@ -1079,7 +1079,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
+       requestSessionResume(sessionId)
+     }
+ 
+-    openSession(sessionId, navigate)
++    openSession(sessionId, navigate, 'stack')
+   }
+ 
+   // The controller's entire callback surface, gathered into the stable

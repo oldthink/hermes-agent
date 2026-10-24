@@ -1,0 +1,652 @@
+diff --git a/apps/desktop/src/app/chat/transcript-backfill.ts b/apps/desktop/src/app/chat/transcript-backfill.ts
+index 5bac291df5..205169e1b8 100644
+--- a/apps/desktop/src/app/chat/transcript-backfill.ts
++++ b/apps/desktop/src/app/chat/transcript-backfill.ts
+@@ -294,6 +294,25 @@ interface StoredRowSlot {
+   leading: ChatMessage[]
+ }
+ 
++/** A message's durable logical ids: its own `messageUid` and the final-row uid a
++ * terminal-frame receipt proved. Empty on rows from backends/legs that carry
++ * neither — uid matching then simply never fires. */
++function messageUidKeys(message: ChatMessage): string[] {
++  const uids: string[] = []
++
++  if (typeof message.messageUid === 'string' && message.messageUid) {
++    uids.push(message.messageUid)
++  }
++
++  const receiptUid = message.persistedTurn?.message_uid
++
++  if (typeof receiptUid === 'string' && receiptUid && !uids.includes(receiptUid)) {
++    uids.push(receiptUid)
++  }
++
++  return uids
++}
++
+ /**
+  * Stored-id merge for a page that overlaps the window but does not anchor in
+  * front of it. A row with no stored id travels with the next stored row after
+@@ -318,6 +337,31 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
+ 
+   const byRowId = new Map<number, StoredRowSlot>()
+ 
++  // uid → the fresh page's message carrying that durable logical id. Built from
++  // the refreshed tail BEFORE placing either side, so a local row can find its
++  // canonical twin even when no physical row id is shared.
++  const refreshedByUid = new Map<string, ChatMessage>()
++
++  for (const message of refreshedTail) {
++    for (const uid of messageUidKeys(message)) {
++      if (!refreshedByUid.has(uid)) {
++        refreshedByUid.set(uid, message)
++      }
++    }
++  }
++
++  const findByUid = (message: ChatMessage): ChatMessage | undefined => {
++    for (const uid of messageUidKeys(message)) {
++      const hit = refreshedByUid.get(uid)
++
++      if (hit !== undefined) {
++        return hit
++      }
++    }
++
++    return undefined
++  }
++
+   const place = (messages: ChatMessage[], fresh: boolean): ChatMessage[] => {
+     let pending: ChatMessage[] = []
+ 
+@@ -325,10 +369,14 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
+       const sourceIds = transcriptRowIds(message)
+       const folded = sourceIds.length ? refreshedBySource.get(sourceIds[0]) : undefined
+ 
+-      // A completed live reply is addressed by its final row; hydration can
+-      // fold that row into an earlier tool bubble. Give both the fold's slot,
+-      // so the fresh copy replaces the live one without losing its leading rows.
+-      // Partial/live bubbles may still hold an uncommitted suffix.
++      // Durable logical identity (message_uid): the settled streamed bubble of a
++      // turn the FOREIGN bridge carried (patch 0010) has no row the page knows —
++      // its uid, stamped from the terminal frame's receipt, is the one key it
++      // shares with the canonical hydrated row. A uid match IS the fold: the
++      // fresh page's copy replaces the local one instead of riding along as a
++      // trailing duplicate bubble (2026-10-22 duplicate-bubble report).
++      const uidFolded = folded === undefined ? findByUid(message) : folded
++
+       const covered =
+         !fresh &&
+         !message.pending &&
+@@ -336,10 +384,10 @@ function mergeOverlappingTail(previous: ChatMessage[], refreshedTail: ChatMessag
+         !message.error &&
+         message.durableComplete !== false &&
+         message.persistedTurn?.complete !== false &&
+-        folded?.role === message.role &&
+-        sourceIds.every(id => refreshedBySource.get(id) === folded)
++        (folded?.role === message.role || (folded === undefined && uidFolded?.role === message.role)) &&
++        (sourceIds.every(id => refreshedBySource.get(id) === folded) || (folded === undefined && uidFolded !== undefined))
+ 
+-      const rowId = covered ? (folded?.rowId ?? message.rowId) : message.rowId
++      const rowId = covered ? (folded?.rowId ?? uidFolded?.rowId ?? message.rowId) : message.rowId
+ 
+       if (rowId === undefined) {
+         // The fresh page's copy of an unstored row wins over the window's.
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+index fce0fabcbb..f9a2074b5c 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+@@ -795,10 +795,19 @@ export function useMessageStream({
+           const hasFinalRow = typeof finalRowId === 'number' && Number.isSafeInteger(finalRowId) && finalRowId > 0
+           const finalPartIndex = message.parts.findLastIndex(part => part.type === 'text')
+ 
++          // The receipt's durable logical id: unlike the row id it survives a
++          // compaction re-insert, so a later refreshed page carrying the
++          // canonical row under a new id can still absorb this bubble by uid.
++          const messageUid =
++            typeof persistedTurn?.message_uid === 'string' && persistedTurn.message_uid
++              ? persistedTurn.message_uid
++              : undefined
++
+           return {
+             ...message,
+             durableComplete: persistedTurn?.complete === true,
+             persistedTurn: persistedTurn ?? undefined,
++            ...(messageUid !== undefined && message.messageUid === undefined ? { messageUid } : {}),
+             // A folded bubble can already address its first source row. Keep
+             // that address and bind the final response's exact source as well.
+             ...(hasFinalRow
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/pending-turn-identity.ts b/apps/desktop/src/app/session/hooks/use-session-actions/pending-turn-identity.ts
+index 486b2a8c48..756d5bb25d 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/pending-turn-identity.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/pending-turn-identity.ts
+@@ -8,8 +8,44 @@ export function transcriptRowIds(message: ChatMessage): number[] {
+   return message.rowId === undefined ? ids : [message.rowId, ...ids]
+ }
+ 
++/**
++ * Durable logical ids a message answers to: its own `messageUid` plus the final
++ * row uid named by a terminal-frame receipt. Unlike physical row ids these
++ * survive compaction re-inserts, so they are the identity of last resort when
++ * every row-id pairing misses (a foreign-bridge turn's settled bubble meeting
++ * the canonical hydrated row).
++ */
++export function transcriptUids(message: ChatMessage): string[] {
++  const uids: string[] = []
++
++  if (typeof message.messageUid === 'string' && message.messageUid) {
++    uids.push(message.messageUid)
++  }
++
++  const receiptUid = message.persistedTurn?.message_uid
++
++  if (typeof receiptUid === 'string' && receiptUid && !uids.includes(receiptUid)) {
++    uids.push(receiptUid)
++  }
++
++  return uids
++}
++
++/** True when the two messages share a durable logical id (uid) — same reply. */
++export function sharesMessageUid(a: ChatMessage, b: ChatMessage): boolean {
++  const aUids = transcriptUids(a)
++
++  return Boolean(aUids.length && transcriptUids(b).some(uid => aUids.includes(uid)))
++}
++
+ /** Unknown identity is not a match, but remains eligible for legacy live projection. */
+ export function conflictingTranscriptIdentity(local: ChatMessage, authoritative: ChatMessage): boolean {
++  // A shared uid is a POSITIVE durable claim that beats any row-id mismatch:
++  // a compaction re-insert gives the same logical row a new physical id.
++  if (sharesMessageUid(local, authoritative)) {
++    return false
++  }
++
+   const localIds = transcriptRowIds(local)
+   const authoritativeIds = transcriptRowIds(authoritative)
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/uid-idempotent-render.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/uid-idempotent-render.test.ts
+new file mode 100644
+index 0000000000..0efd0cc841
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/uid-idempotent-render.test.ts
+@@ -0,0 +1,109 @@
++import { describe, expect, it } from 'vitest'
++
++import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
++import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
++
++import { preserveLocalPendingTurnMessages } from './utils'
++
++const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
++  ({ id, role, parts: [{ type: 'text', text }], ...extra }) as ChatMessage
++
++// The 2026-10-22 duplicate-bubble shape, replayed at the reconcile layer: a
++// foreign-bridge (patch 0010) turn streamed live into a session the desktop had
++// open — its tool-round narration sealed as its own interim bubble, the reply
++// streamed into the live stream bubble, and the terminal frame carried a
++// persisted_turn receipt (address-only: a foreign process cannot prove the
++// pre-turn prefix). When the canonical DB page lands, hydration FOLDS the
++// narration row and the reply row into one assistant bubble, so no text guard
++// can pair the stream bubble (reply only) with the fold (narration + reply):
++// not identical, and neither extends the other. Without a durable key the
++// stream bubble is re-appended and the reply paints twice. Its message_uid —
++// stamped from the receipt — is that key.
++const UID = 'd1e2f3a4b5c6478890a1b2c3d4e5f607'
++
++const previousWindow = (): ChatMessage[] => [
++  msg('older-user', 'user', 'earlier question', { rowId: 100 }),
++  msg('older-assistant', 'assistant', 'earlier answer', { rowId: 101 }),
++  msg('user-9-x', 'user', 'did the background wake land?'),
++  msg('assistant-interim-9-1', 'assistant', 'Checking the logs first.', { interim: true, pending: false }),
++  msg('assistant-stream-9-0', 'assistant', 'All clear, the wake landed clean.', {
++    pending: false,
++    persistedTurn: { row_ids: [44827, 44828], complete: false, final_assistant_row_id: 44828, message_uid: UID }
++  })
++]
++
++/** The canonical hydrated page: the turn's rows folded into one bubble. */
++const canonicalPage = (): ChatMessage[] => [
++  msg('s-older-user', 'user', 'earlier question', { rowId: 100 }),
++  msg('s-older-assistant', 'assistant', 'earlier answer', { rowId: 101 }),
++  msg('s-user', 'user', 'did the background wake land?', { rowId: 44827 }),
++  msg('s-assistant', 'assistant', 'Checking the logs first.\n\nAll clear, the wake landed clean.', {
++    rowId: 44828,
++    messageUid: UID
++  })
++]
++
++describe('idempotent render by message_uid (foreign-bridge duplicate bubble)', () => {
++  it('a uid-receipted streamed bubble is absorbed by the canonical folded row', () => {
++    const merged = preserveLocalPendingTurnMessages(canonicalPage(), previousWindow())
++
++    // One reply on screen: the canonical fold. The stream bubble and the
++    // sealed interim are both represented by it — no second "All clear".
++    const replies = merged.filter(message => message.role === 'assistant' && !message.hidden)
++    expect(replies.map(reply => chatMessageText(reply).trim())).toEqual([
++      'earlier answer',
++      'Checking the logs first.\n\nAll clear, the wake landed clean.'
++    ])
++    expect(replies.at(-1)?.rowId).toBe(44828)
++    expect(replies.at(-1)?.messageUid).toBe(UID)
++  })
++
++  it('the graft leg keeps one canonical copy when the window overlaps the page', () => {
++    const merged = graftRefreshedTailOntoBackfill(
++      canonicalPage().slice(2),
++      previousWindow().filter(message => message.id !== 'older-assistant')
++    )
++
++    expect(merged.filter(m => chatMessageText(m).includes('All clear'))).toHaveLength(1)
++  })
++
++  it('distinct replies with distinct uids never absorb each other — failure control', () => {
++    // A deliberately-duplicated event: the page carries a DIFFERENT reply under
++    // a DIFFERENT uid while the streamed bubble is still uid-keyed to its own
++    // receipt. Identity, not prose, must decide — and here it must decide these
++    // are two replies, keeping both.
++    const next = [...canonicalPage(), msg('s-later', 'assistant', 'A different reply entirely.', {
++      rowId: 44900,
++      messageUid: '0f1e2d3c4b5a69788796a5b4c3d2e1f0'
++    })]
++
++    const merged = preserveLocalPendingTurnMessages(next, previousWindow())
++
++    const texts = merged
++      .filter(message => message.role === 'assistant' && !message.hidden)
++      .map(message => chatMessageText(message).trim())
++
++    expect(texts).toEqual([
++      'earlier answer',
++      'Checking the logs first.\n\nAll clear, the wake landed clean.',
++      'A different reply entirely.'
++    ])
++  })
++
++  it('a uid-less streamed bubble keeps the legacy guards (no regression on old backends)', () => {
++    // Older backends emit no receipt: the settled bubble carries no uid and the
++    // pre-existing text guards alone decide. This exact shape (interim-sealed
++    // narration vs folded canonical text) leaks through them — that IS the
++    // 2026-10-22 bug on backends without the receipt — but the uid path must
++    // not make it worse: the canonical row stays exactly once either way.
++    const legacyPrevious = [
++      ...previousWindow().slice(0, 4),
++      msg('assistant-stream-9-0', 'assistant', 'All clear, the wake landed clean.', { pending: false })
++    ]
++
++    const merged = preserveLocalPendingTurnMessages(canonicalPage(), legacyPrevious)
++
++    expect(merged.filter(m => chatMessageText(m).includes('All clear, the wake landed clean.')).length).toBeGreaterThanOrEqual(1)
++    expect(merged.filter(m => m.rowId === 44828)).toHaveLength(1)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+index 1d79a4d796..0c6592ead7 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+@@ -72,6 +72,7 @@ import {
+   acknowledgedTranscriptBoundary,
+   conflictingTranscriptIdentity,
+   persistedTurnsEquivalent,
++  sharesMessageUid,
+   transcriptRowIds
+ } from './pending-turn-identity'
+ 
+@@ -153,14 +154,18 @@ function replyAfterLastTool(message: ChatMessage): string {
+ function carryRowIdentity(next: ChatMessage, previous: ChatMessage): ChatMessage {
+   const rowId = next.rowId === undefined ? previous.rowId : undefined
+   const reactions = next.reactions === undefined && previous.reactions?.length ? previous.reactions : undefined
++  // The durable logical uid rides with the row id: a settled live bubble that
++  // round-trips into a hydrated copy keeps its absorb key.
++  const messageUid = next.messageUid === undefined ? previous.messageUid : undefined
+ 
+-  if (rowId === undefined && !reactions) {
++  if (rowId === undefined && !reactions && messageUid === undefined) {
+     return next
+   }
+ 
+   return {
+     ...next,
+     ...(rowId !== undefined ? { rowId } : {}),
++    ...(messageUid !== undefined ? { messageUid } : {}),
+     ...(reactions ? { reactions: [...reactions] } : {})
+   }
+ }
+@@ -232,6 +237,10 @@ const _chatMessageFieldsExhaustive: {
+ 
+ const COMPARED_FIELDS = [
+   'rowId',
++  // Durable logical identity (message_uid): like rowId, an identity change
++  // means the bubble now addresses a different durable row — reconciliation
++  // must publish even when the visible text is unchanged.
++  'messageUid',
+   'persistedTurn',
+   'durableComplete',
+   'recovered',
+@@ -1042,6 +1051,19 @@ export function preserveLocalPendingTurnMessages(
+     const authoritative =
+       ordinalMatch && !conflictingTranscriptIdentity(message, ordinalMatch) ? ordinalMatch : undefined
+ 
++    // Durable logical identity: this bubble's message_uid names a row the fresh
++    // page carries (compaction may have re-inserted it under a new physical id).
++    // The canonical row owns the slot — re-appending this copy paints the same
++    // reply twice (2026-10-22 foreign-bridge duplicate bubble). Row-text guards
++    // cannot catch the folded-narration shape, so key on the uid itself.
++    const uidTwin = candidates.find(
++      candidate => candidate.role === 'assistant' && !isLiveTailRow(candidate) && sharesMessageUid(message, candidate)
++    )
++
++    if ((isPendingAssistant || isSettledUnpersistedAssistant) && uidTwin) {
++      continue
++    }
++
+     // A settled stream row (`pending: false` after message.complete) whose reply
+     // the authoritative transcript already carries under its committed id is
+     // stale: ordinal pairing can't see it, because the commit shifted the row
+diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
+index f04de45b2a..5b8a904b8c 100644
+--- a/apps/desktop/src/lib/chat-messages/hydration.ts
++++ b/apps/desktop/src/lib/chat-messages/hydration.ts
+@@ -606,6 +606,13 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+       ...(message.display_kind === 'process_complete' ? { asyncResultKind: 'process' as const } : {}),
+       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
+       ...(rowId !== undefined ? { rowId } : {}),
++      // Durable logical id of the row this bubble's reply belongs to: the fold
++      // can merge several rows into one bubble, and a tool-only assistant row
++      // leads the bubble its final reply later joins — stamp only when THIS row
++      // is the visible reply (same gate as durableComplete's rowId anchor).
++      ...(typeof message.message_uid === 'string' && message.message_uid && displayRole === 'assistant'
++        ? { messageUid: message.message_uid }
++        : {}),
+       ...(pendingAbsorbedRows > 0 ? { serverRowSpan: pendingAbsorbedRows + 1 } : {}),
+       ...(reactions.length ? { reactions } : {}),
+       ...(message.role === 'assistant' && messageInterrupted(message.display_metadata) ? { interrupted: true } : {}),
+diff --git a/apps/desktop/src/lib/chat-messages/types.ts b/apps/desktop/src/lib/chat-messages/types.ts
+index 9edbc440d4..a0bcca7227 100644
+--- a/apps/desktop/src/lib/chat-messages/types.ts
++++ b/apps/desktop/src/lib/chat-messages/types.ts
+@@ -65,6 +65,14 @@ export type ChatMessage = {
+   attachmentRefs?: string[]
+   /** Durable backend `messages.id`. Absent until the row is persisted. */
+   rowId?: number
++  /** Durable logical id (`messages.message_uid`) of the row this bubble's final
++   *  reply settles into — minted once at first insert, kept by every later copy
++   *  of that logical message (compaction generation, rotation child, replace).
++   *  Unlike `rowId` it survives re-inserts, so the reconcile layers can key the
++   *  streamed bubble's absorption by it when a refreshed page brings the
++   *  canonical row under a different physical id. Stamped from the terminal
++   *  frame's persisted-turn receipt (live leg) or the stored row (hydration). */
++  messageUid?: string
+   /** Backend transcript rows this message represents — the hydration fold
+    *  merges a turn's tool rows into the assistant message they belong to, so a
+    *  message is not one backend row. The older-page offset (transcript-tail) is
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 5106d1c233..b9f0233d2e 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -734,6 +734,10 @@ export interface SessionMessage {
+    */
+   row_id?: number
+   id?: number
++  /** Durable logical id (`messages.message_uid`): the row's identity across
++   *  re-inserts (compaction generation, rotation child). The REST transcript
++   *  path (SELECT *) already ships it; absent on older backends. */
++  message_uid?: string
+   text?: unknown
+   timestamp?: number
+   tool_call_id?: null | string
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index b1a83beaca..5a4ef83507 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -4710,12 +4710,13 @@ export interface ErrorSurface {
+   resets_at?: number | null
+   [key: string]: unknown
+ }
+-/** Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are unproven, never negative acknowledgements. ``complete`` permits retiring the whole local turn only when the original turn boundary, every row and final body are still accounted for; compaction, redirects and partial writes conservatively leave it false. Row ids are scoped to the owning profile's store, as in ``SessionMessage.row_id``. */
++/** Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are unproven, never negative acknowledgements. ``complete`` permits retiring the whole local turn only when the original turn boundary, every row and final body are still accounted for; compaction, redirects and partial writes conservatively leave it false. Row ids are scoped to the owning profile's store, as in ``SessionMessage.row_id``. ``message_uid`` is the durable logical id of the proven final row — unlike a row id it survives compaction re-inserts, so a client can key its streamed bubble on it and let the canonical row absorb the bubble instead of painting a second one. */
+ export interface PersistedTurn {
+   row_ids: number[]
+   complete: boolean
+   user_row_id?: number | null
+   final_assistant_row_id?: number | null
++  message_uid?: string | null
+ }
+ /** ``server._status_update`` and the direct emitters (goal / loop / heartbeat / process). */
+ export interface StatusUpdatePayload {
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 21bb18e517..86b42adb27 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -20636,7 +20636,7 @@
+       },
+       "PersistedTurn": {
+         "additionalProperties": false,
+-        "description": "Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are\nunproven, never negative acknowledgements. ``complete`` permits retiring the whole local\nturn only when the original turn boundary, every row and final body are still accounted\nfor; compaction, redirects and partial writes conservatively leave it false. Row ids are\nscoped to the owning profile's store, as in ``SessionMessage.row_id``.",
++        "description": "Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are\nunproven, never negative acknowledgements. ``complete`` permits retiring the whole local\nturn only when the original turn boundary, every row and final body are still accounted\nfor; compaction, redirects and partial writes conservatively leave it false. Row ids are\nscoped to the owning profile's store, as in ``SessionMessage.row_id``. ``message_uid`` is\nthe durable logical id of the proven final row \u2014 unlike a row id it survives compaction\nre-inserts, so a client can key its streamed bubble on it and let the canonical row absorb\nthe bubble instead of painting a second one.",
+         "properties": {
+           "row_ids": {
+             "items": {
+@@ -20672,6 +20672,18 @@
+             ],
+             "default": null,
+             "title": "Final Assistant Row Id"
++          },
++          "message_uid": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Message Uid"
+           }
+         },
+         "required": [
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 984024cc3b..95d8e0ba27 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -207,8 +207,56 @@ class _DesktopSessionEventBridge:
+         }
+         if result.get("error"):
+             payload["error"] = str(result["error"])
++        # Durable identity for the streamed bubble (idempotent render by message_uid): the
++        # native gateway's message.complete builds the same receipt from this same result
++        # (tui_gateway.prompt_turn._persisted_turn_receipt); the bridged desktop bubble must
++        # not be the one surface that cannot key its absorb on it. Carried as a plain dict —
++        # contracts.check_payload validates the merged frame at emit() below.
++        receipt = self._persisted_turn_receipt(result)
++        if receipt is not None:
++            payload["persisted_turn"] = receipt
+         self.emit("message.complete", payload)
+ 
++    @staticmethod
++    def _persisted_turn_receipt(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++        """The committed-row receipt for a foreign-gateway turn result, or None.
++
++        Mirrors ``tui_gateway.prompt_turn._persisted_turn_receipt``'s committed-row
++        selection over the turn's message dicts (``_db_persisted`` + ``_row_id``),
++        minus the history/prefix bookkeeping that lives on the native ``_TurnRun``:
++        a foreign process cannot prove the pre-turn prefix, so the receipt is
++        address-only (``complete`` stays False). The final row's ``message_uid``
++        is the part the desktop needs — it survives compaction re-inserts.
++        """
++        from agent.context_compressor import _DB_PERSISTED_MARKER
++        from agent.message_metadata import message_uid_or_none
++
++        messages = result.get("messages")
++        if not isinstance(messages, list):
++            return None
++
++        def committed_id(message: Any) -> Optional[int]:
++            row_id = message.get("_row_id") if isinstance(message, dict) else None
++            return row_id if isinstance(message, dict) and message.get(_DB_PERSISTED_MARKER) \
++                and type(row_id) is int and row_id > 0 else None
++
++        row_ids = [rid for message in messages if isinstance(message, dict)
++                   and (rid := committed_id(message)) is not None]
++        if not row_ids:
++            return None
++
++        receipt: Dict[str, Any] = {"row_ids": row_ids, "complete": False}
++        last = messages[-1] if isinstance(messages[-1], dict) else {}
++        final_id = committed_id(last)
++        final_text = str(result.get("final_response") or "")
++        if (final_id is not None and last.get("role") == "assistant"
++                and not last.get("tool_calls") and last.get("content") == final_text):
++            receipt["final_assistant_row_id"] = final_id
++            uid = message_uid_or_none(last)
++            if uid is not None:
++                receipt["message_uid"] = uid
++        return receipt
++
+     def close(self, timeout: float = 1.5) -> None:
+         if self._thread is None:
+             return
+diff --git a/tests/tui_gateway/contracts/test_bridge_emit_contracts.py b/tests/tui_gateway/contracts/test_bridge_emit_contracts.py
+index 14cd3e8e10..d1c02713cf 100644
+--- a/tests/tui_gateway/contracts/test_bridge_emit_contracts.py
++++ b/tests/tui_gateway/contracts/test_bridge_emit_contracts.py
+@@ -50,3 +50,51 @@ def test_real_emit_raises_on_bad_payload_under_strict():
+     with pytest.raises(registry.ContractViolation):
+         b.emit("tool.start", {"tool_id": "x", "name": "t",
+                               "labels": {"verb": "Running", "target": "y", " Past": "Running"}})
++
++
++def _committed_turn_result() -> tuple[dict, dict]:
++    """A foreign-gateway turn result whose suffix the agent already flushed to the DB:
++    the user row and final reply both carry ``_db_persisted`` and ``_row_id``. Returns
++    the result plus the final assistant dict (its uid is random — read it back)."""
++    from agent.context_compressor import _DB_PERSISTED_MARKER
++    from agent.message_metadata import stamp_message_uid
++
++    user: dict = {"role": "user", "content": "check the logs"}
++    assistant: dict = {"role": "assistant", "content": "all clear"}
++    stamp_message_uid(user)
++    stamp_message_uid(assistant)
++    for index, message in enumerate((user, assistant)):
++        message["_row_id"] = 4400 + index
++        message[_DB_PERSISTED_MARKER] = True
++    return {"final_response": "all clear", "messages": [user, assistant]}, assistant
++
++
++def test_bridge_turn_complete_carries_persisted_turn_receipt_with_message_uid():
++    """Patch-0010's bridged message.complete must carry the same durable identity the
++    native gateway's frame does: without it the Desktop's streamed bubble cannot key its
++    absorb, and the canonical DB row lands as a SECOND bubble (2026-10-22 duplicate bubble).
++    A receipt whose final row body matches the final response names the final row id + uid;
++    the foreign process cannot prove the pre-turn prefix, so ``complete`` stays False."""
++    result, final_row = _committed_turn_result()
++    b = _probe()
++    b.on_turn_complete(result)
++
++    (event, payload), *_ = [(it["event"], it["payload"]) for it in b._queue.queue]
++    assert event == "message.complete"
++    registry.check_payload(event, payload)  # STRICT: persisted_turn must validate
++    assert payload["persisted_turn"] == {
++        "row_ids": [4400, 4401],
++        "complete": False,
++        "final_assistant_row_id": 4401,
++        "message_uid": final_row["message_uid"],
++    }
++
++
++def test_bridge_turn_complete_omits_receipt_without_committed_rows():
++    """No committed rows → no receipt: absence is unproven, never a negative claim
++    (mirrors tui_gateway.prompt_turn._persisted_turn_receipt)."""
++    b = _probe()
++    b.on_turn_complete({"final_response": "draft", "messages": [{"role": "assistant", "content": "draft"}]})
++
++    (_, payload), *_ = [(it["event"], it["payload"]) for it in b._queue.queue]
++    assert "persisted_turn" not in payload
+diff --git a/tests/tui_gateway/test_submit_time_user_row.py b/tests/tui_gateway/test_submit_time_user_row.py
+index ac55d3a003..e5cfa12e7e 100644
+--- a/tests/tui_gateway/test_submit_time_user_row.py
++++ b/tests/tui_gateway/test_submit_time_user_row.py
+@@ -132,6 +132,9 @@ def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch,
+             "user_row_id": rows[-2]["_row_id"],
+             "row_ids": [row["_row_id"] for row in rows[-2:]],
+             "final_assistant_row_id": rows[-1]["_row_id"],
++            # The proven final row's durable logical id rides along (idempotent render
++            # key) — the flush stamped it on the live dict and the column agrees.
++            "message_uid": rows[-1]["message_uid"],
+             "complete": True,
+         }
+         # Compression can discard an already-streamed segment even while the old prefix survives.
+diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
+index 0b4eb62340..f76e32c741 100644
+--- a/tui_gateway/contracts/events.py
++++ b/tui_gateway/contracts/events.py
+@@ -178,12 +178,16 @@ class PersistedTurn(Payload):
+     unproven, never negative acknowledgements. ``complete`` permits retiring the whole local
+     turn only when the original turn boundary, every row and final body are still accounted
+     for; compaction, redirects and partial writes conservatively leave it false. Row ids are
+-    scoped to the owning profile's store, as in ``SessionMessage.row_id``."""
++    scoped to the owning profile's store, as in ``SessionMessage.row_id``. ``message_uid`` is
++    the durable logical id of the proven final row — unlike a row id it survives compaction
++    re-inserts, so a client can key its streamed bubble on it and let the canonical row absorb
++    the bubble instead of painting a second one."""
+ 
+     row_ids: list[int]
+     complete: bool
+     user_row_id: int | None = None
+     final_assistant_row_id: int | None = None
++    message_uid: str | None = None
+ 
+ 
+ class MessageCompletePayload(Payload):
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 0cc90dee8a..c410ad969f 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -887,6 +887,7 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
+     additionally requires the unchanged pre-turn prefix and no redirected user boundary.
+     """
+     from agent.context_compressor import _DB_PERSISTED_MARKER
++    from agent.message_metadata import message_uid_or_none
+ 
+     messages = st.result.get("messages")
+     start = getattr(st.agent, "_persist_user_message_idx", None)
+@@ -914,6 +915,13 @@ def _persisted_turn_receipt(st: _TurnRun, raw: Any, status: str) -> dict | None:
+     if (status == "complete" and last.get("role") == "assistant" and not last.get("tool_calls")
+             and last.get("content") == raw and (final_id := committed_id(last)) is not None):
+         receipt["final_assistant_row_id"] = final_id
++        # The row's durable logical id (agent/message_metadata): a client that keyed its
++        # streamed bubble on this uid can let the canonical row absorb the bubble even after
++        # a compaction re-insert changed the physical row id. Live-dict key or column — the
++        # committed dict carries both (copy_identity_fields on flush-back).
++        uid = message_uid_or_none(last)
++        if uid is not None:
++            receipt["message_uid"] = uid
+     prefix_unchanged = start == len(st.history) and all(
+         committed_id(before) is not None and committed_id(before) == committed_id(after)
+         for before, after in zip(st.history, messages[:start]))
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index fb5ef2cc03..78bc3a0518 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -787,6 +787,19 @@ def broadcast_foreign_session_event(event: str, session_id: str, payload: dict |
+                     sess["_foreign_running_ts"] = now
+                 elif event in ("message.complete", "error"):
+                     sess["_foreign_running"] = False
++    # One line at the terminal edge (patch 0010 mirror path): the 2026-10-22 duplicate-bubble
++    # forensics found desktop.log/gui.log silent for the whole bridge window, so this class of
++    # misrender was only diagnosable from the DB. Terminal frames are once per turn; keep the
++    # stream frames quiet. payload already redacted upstream of a dict summary.
++    if event == "message.complete":
++        receipt = payload.get("persisted_turn") if isinstance(payload, dict) else None
++        logger.info(
++            "foreign-session-event message.complete sid=%s matched=%d status=%s receipt=%s uid=%s",
++            sid_str, len(matched_sids),
++            (payload or {}).get("status") if isinstance(payload, dict) else None,
++            receipt if isinstance(receipt, dict) and receipt else None,
++            receipt.get("message_uid") if isinstance(receipt, dict) else None,
++        )
+     with _live_transports_lock:
+         targets = list(_live_transports)
+     if not targets:

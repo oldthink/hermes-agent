@@ -185,6 +185,12 @@ _SPECS = [
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
+        _arg("--subscribe", action="store_true",
+             help="Subscribe the calling session to this task's events (completion, "
+                  "gave_up, block) and stamp its validated session id. Exits 2 when "
+                  "no notification target resolves (stateless shell, cron, dispatched "
+                  "worker env). Without the flag no subscription is written and the "
+                  "creating session is NOT woken on completion."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "

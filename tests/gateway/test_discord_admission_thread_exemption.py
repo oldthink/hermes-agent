@@ -78,4 +78,5 @@ def test_third_party_mention_in_a_plain_channel_is_still_dropped_and_logged(monk
     admitted, _ = _adapter()._discord_message_admission(
         _mentions_third_party(SimpleNamespace(id=THREAD_ID, parent_id=None)), claim=False)
     assert admitted is False
-    assert any("admission: dropping message 123" in r.getMessage() for r in caplog.records)
+    assert any("admission: drop msg=123" in r.getMessage() and "reason=mentions_others_not_self"
+               in r.getMessage() for r in caplog.records)

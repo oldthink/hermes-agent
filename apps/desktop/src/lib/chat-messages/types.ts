@@ -65,6 +65,14 @@ export type ChatMessage = {
   attachmentRefs?: string[]
   /** Durable backend `messages.id`. Absent until the row is persisted. */
   rowId?: number
+  /** Durable logical id (`messages.message_uid`) of the row this bubble's final
+   *  reply settles into — minted once at first insert, kept by every later copy
+   *  of that logical message (compaction generation, rotation child, replace).
+   *  Unlike `rowId` it survives re-inserts, so the reconcile layers can key the
+   *  streamed bubble's absorption by it when a refreshed page brings the
+   *  canonical row under a different physical id. Stamped from the terminal
+   *  frame's persisted-turn receipt (live leg) or the stored row (hydration). */
+  messageUid?: string
   /** Backend transcript rows this message represents — the hydration fold
    *  merges a turn's tool rows into the assistant message they belong to, so a
    *  message is not one backend row. The older-page offset (transcript-tail) is
@@ -87,8 +95,6 @@ export type GatewayEventPayload = {
   name?: string
   tool_id?: string
   tool_call_id?: string
-  /** tool.progress: 0-100 when the MCP server sent a total. */
-  percent?: number | null
   args?: unknown
   arguments?: unknown
   context?: string
@@ -127,19 +133,6 @@ export type GatewayEventPayload = {
   install_warning?: string
   personality?: string
   usage?: Partial<UsageStats>
-  // Canonical session.usage ticks carry cumulative counters at the payload top level; older ticker frames nest the desktop Usage shape above.
-  api_calls?: number | null
-  cache_read_tokens?: number | null
-  completion_tokens?: number | null
-  compression_count?: number | null
-  context_length?: number | null
-  context_source?: string | null
-  input_tokens?: number | null
-  last_prompt_tokens?: number | null
-  output_tokens?: number | null
-  prompt_tokens?: number | null
-  tokens_per_s?: number | null
-  total_tokens?: number | null
   // agent.terminal.output — live chunk for a read-only agent terminal tab
   process_id?: string
   chunk?: string
@@ -180,6 +173,8 @@ export type GatewayEventPayload = {
   kind?: string
   // pane.reveal (agent focusing a desktop pane via the focus_pane tool)
   pane?: string
+  // layout.apply (agent applying a layout preset via the apply_layout tool)
+  preset?: string
   // tour.request (tour tool — agent-guided driver.js walkthrough). `action`
   // and `steps` name the tour verb and step list; `surface` picks the app's
   // own DOM vs the preview pane's guest page. tip.show (tip tool — one accent

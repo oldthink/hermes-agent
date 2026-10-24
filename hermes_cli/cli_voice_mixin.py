@@ -231,6 +231,13 @@ class CLIVoiceMixin:
                 self._voice_invalidate()
                 self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
+                # Local patch 0002: a genuine voice turn resets the runaway watchdog.
+                if _runaway_sid := getattr(self, "session_id", None):
+                    try:
+                        from agent.runaway_watchdog import note_user_message as _runaway_note_user
+                        _runaway_note_user(_runaway_sid)
+                    except Exception:
+                        pass
             elif result.get("success"):
                 _cprint(f"{_DIM}{t('cli.voice.no_speech')}{_RST}")
             else:
@@ -457,6 +464,13 @@ class CLIVoiceMixin:
                         return
                 self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
+                # Local patch 0002: a genuine voice barge-in resets the runaway watchdog.
+                if _runaway_sid := getattr(self, "session_id", None):
+                    try:
+                        from agent.runaway_watchdog import note_user_message as _runaway_note_user
+                        _runaway_note_user(_runaway_sid)
+                    except Exception:
+                        pass
             elif not result.get("success"):
                 _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
         except Exception as e:

@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -32,7 +33,7 @@ from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
-from hermes_cli.kanban_parser import build_parser
+from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 
 
 # --- Flag parsing helpers ---
@@ -360,6 +361,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    subscribe = bool(getattr(args, "subscribe", False))
+    target = None
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -378,11 +381,50 @@ def _cmd_create(args: argparse.Namespace) -> int:
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
+        # Explicit opt-in: NEVER default-on, and MUST-NOT fall back to HERMES_SESSION_ID for
+        # target resolution (upstream refusal docstring at tools/kanban_tools.py:1183-1188).
+        # Routed directly, not via _maybe_auto_subscribe: the config gate and exception
+        # swallowing there would turn an explicit flag into a silent no-op.
+        if subscribe:
+            from tools.kanban_tools import _persisted_session_id, _resolve_notify_target
+
+            target = _resolve_notify_target()
+            if target is None:
+                return _err(
+                    f"kanban: --subscribe: no notification target resolves for this "
+                    f"session (stateless shell, cron, or a dispatched worker env) — "
+                    f"{task_id} was created WITHOUT a completion subscription. "
+                    f"Re-run `kanban notify-subscribe {task_id} <platform> <chat_id>` "
+                    f"from the session that must be woken.", 2)
+            from hermes_cli import kanban_db_notify as _kbn
+
+            try:
+                _kbn.add_notify_sub(conn, task_id=task_id, **target)
+            except sqlite3.Error as exc:
+                return _err(f"kanban: --subscribe: writing the subscription for "
+                            f"{task_id} failed: {exc}", 2)
+            # Stamped ONLY on this success path; value is the state.db-validated id,
+            # never a bare environment read.
+            stamp = _persisted_session_id(os.environ.get("HERMES_SESSION_ID"))
+            if stamp:
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?",
+                                 (stamp, task_id))
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if subscribe:
+            print(f"Subscribed {target['platform']}:{target['chat_id']} to {task_id}"
+                  if target else f"Subscribed to {task_id}")
+        else:
+            # Bare create is still allowed (scripts, recovery wrapper), but the creating
+            # session is not woken on completion — say so instead of letting it read as
+            # the old (false) auto-subscribe claim.
+            print(f"⚠ no notification subscription was created for {task_id} — the creating "
+                  f"session will NOT be woken on completion. Pass --subscribe to subscribe "
+                  f"this session.", file=sys.stderr)
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:
@@ -1349,7 +1391,8 @@ Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
-  `create <title>…`     Create a task (auto-subscribes you to events)
+  `create <title>…`     Create a task (no notification subscription unless you pass
+                        `--subscribe`)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done

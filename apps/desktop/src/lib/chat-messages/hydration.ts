@@ -1,6 +1,5 @@
 import { skillInvocationText } from '@hermes/shared'
 
-import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { splitLeadingAttachmentRefs } from '@/components/assistant-ui/reference-kinds'
 import { extractImageRefs } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
@@ -34,20 +33,6 @@ const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
 const LEGACY_HEARTBEAT_ROW_RE = /^\[Background process \S+ heartbeat #\d+ /
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
 const CONTEXT_REF_RE = /@(file|folder|url|image|tool|terminal):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
-
-// Native ingress persists the image-routing hints followed by one placeholder
-// per flattened image part. Recognize that suffix only, not quoted caption prose.
-function persistedImageRefs(text: string) {
-  const suffix = /\n\n((?:\[Image attached(?: at)?: [^\n]+\]\n)+)((?:\[screenshot\](?:\n|$))+)$/.exec(text)
-
-  if (!suffix) { return extractImageRefs(text) }
-  const paths = [...suffix[1].matchAll(/^\[Image attached(?: at)?: (.+)\]$/gm)].map(match => match[1])
-
-  if (paths.length !== suffix[2].split('[screenshot]').length - 1) { return extractImageRefs(text) }
-  const extracted = extractImageRefs(text.slice(0, suffix.index))
-
-  return { cleanedText: extracted.cleanedText, refs: [...extracted.refs, ...paths.map(path => `@image:${formatRefValue(path)}`)] }
-}
 
 // Gateway routing note for Discord turns (gateway/run_inbound.py::discord_triggering_note).
 // Current gateways persist the authored text; this heals rows written before that fix. Only
@@ -203,12 +188,6 @@ function parseDisplayMetadata(metadata: SessionMessage['display_metadata']): nul
   }
 
   return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
-}
-
-// A micro-compaction merge (`display_metadata.model_only`) is the model's copy of prompts whose originals
-// the history shows: the owner's resume snapshot keeps it as an undo target, and it is never painted.
-function isPainted(message: SessionMessage): boolean {
-  return parseDisplayMetadata(message.display_metadata)?.model_only !== true
 }
 
 // `agent/conversation_loop.py::_failed_turn_display_metadata`: the failed turn's error card,
@@ -423,10 +402,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     clearPendingTools()
   }
 
-  // `index` stays the stored row position (it keys tool-part and message ids), so skipped merges shift nothing.
-  const painted = messages.flatMap((message, index) => (isPainted(message) ? [{ index, message }] : []))
-
-  painted.forEach(({ message, index }) => {
+  messages.forEach((message, index) => {
     if (message.role === 'assistant') {
       nearestAssistant = message
     } else if (message.role === 'user' || message.role === 'system') {
@@ -483,7 +459,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     // optimistic composer already uses) and render them via the dedicated
     // attachments row below the bubble instead. The leading `@file:` block
     // (attached files, large pastes) moves there too, for the same parity.
-    const imageRefExtraction = displayRole === 'user' && rawDisplayContent ? persistedImageRefs(rawDisplayContent) : null
+    const imageRefExtraction = displayRole === 'user' && rawDisplayContent ? extractImageRefs(rawDisplayContent) : null
     const fileRefExtraction = imageRefExtraction ? splitLeadingAttachmentRefs(imageRefExtraction.cleanedText) : null
     const displayContent = fileRefExtraction ? fileRefExtraction.text : rawDisplayContent
     const liftedRefs = [...(fileRefExtraction?.refs ?? []), ...(imageRefExtraction?.refs ?? [])]
@@ -566,9 +542,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     let pendingAbsorbedRows = 0
 
-    // A machine notice stored as an assistant row (the failed-turn boundary) is
-    // Hermes speaking: it must not join the tool-call reply it follows.
-    if (displayRole === 'assistant') {
+    if (message.role === 'assistant') {
       if (pendingToolParts.length) {
         if (!appendPartsToActiveAssistant(pendingToolParts, message.timestamp ?? pendingToolTimestamp)) {
           parts.unshift(...pendingToolParts)
@@ -632,6 +606,13 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       ...(message.display_kind === 'process_complete' ? { asyncResultKind: 'process' as const } : {}),
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),
+      // Durable logical id of the row this bubble's reply belongs to: the fold
+      // can merge several rows into one bubble, and a tool-only assistant row
+      // leads the bubble its final reply later joins — stamp only when THIS row
+      // is the visible reply (same gate as durableComplete's rowId anchor).
+      ...(typeof message.message_uid === 'string' && message.message_uid && displayRole === 'assistant'
+        ? { messageUid: message.message_uid }
+        : {}),
       ...(pendingAbsorbedRows > 0 ? { serverRowSpan: pendingAbsorbedRows + 1 } : {}),
       ...(reactions.length ? { reactions } : {}),
       ...(message.role === 'assistant' && messageInterrupted(message.display_metadata) ? { interrupted: true } : {}),

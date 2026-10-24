@@ -1,0 +1,66 @@
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index e2b5612d7d..6e1668dd46 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1273,6 +1273,12 @@ class GatewayNotificationsMixin:
+         ``True`` on adapter acceptance, ``False`` on retryable adapter failure, ``None`` with no
+         gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
+         """
++        from agent.estop import check_paused
++        # Local patch 0001: gate at function entry — two early-return branches self-post through
++        # _self_post_api_server BEFORE admit_internal_event, so a late gate would leave api-server
++        # sessions waking during a pause. Returning False = retryable; the queue redelivers post-resume.
++        if check_paused("watch", logger):
++            return False
+         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
+         source = await asyncio.to_thread(self._build_process_event_source, evt)
+         if not source:
+diff --git a/hermes_cli/cli_process_notifications.py b/hermes_cli/cli_process_notifications.py
+index 8123189638..d3562c7c85 100644
+--- a/hermes_cli/cli_process_notifications.py
++++ b/hermes_cli/cli_process_notifications.py
+@@ -1,5 +1,7 @@
+ """CLI notification ownership, structured queueing and last-moment consumption."""
+ 
++import logging
++
+ 
+ class CLIProcessNotificationsMixin:
+     def _owns_process_notification(self, event: dict) -> bool:
+@@ -34,6 +36,11 @@ class CLIProcessNotificationsMixin:
+         return mode == "off"
+ 
+     def _drain_process_notifications(self, consumer: str) -> None:
++        from agent.estop import check_paused
++        # Local patch 0001: estop holds CLI process-wake drains too — the queue keeps the
++        # events; the idle/post-turn poller re-drains them as one batch after resume.
++        if check_paused("cli-process-wakes", logging.getLogger("hermes_cli.process_notifications")):
++            return
+         from tools.process_registry import process_registry
+         from tools.async_delegation import claim_event_delivery, complete_event_delivery
+         from tools.process_registry_notifications import (
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index b17807be8c..7552219670 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -5,6 +5,7 @@ desktop UI wiring, HUD surface note. Bodies are rebound onto server.py's globals
+ from __future__ import annotations
+ 
+ import contextlib
++import logging
+ 
+ from .method_ctx import bind_module
+ 
+@@ -149,6 +150,12 @@ def _notif_claim_turn(session: dict) -> bool:
+     """Claim the idle session (running=True) under history_lock; False if a turn is live.
+     After the user's Stop no automatic turn starts: the cancel latch holds notifications
+     (requeued by the callers) until the next user prompt clears it."""
++    from agent.estop import check_paused
++    # Local patch 0001: process-completion wakes are internal events that bypass the inbound
++    # estop gate (run_inbound._hm_estop_gate exempts is_internal) — a `hermes pause` must hold
++    # them too. Unclaimed events requeue; the poller re-claims and batches them after resume.
++    if check_paused("tui-process-wakes", logging.getLogger("tui_gateway.session_notifications")):
++        return False
+     with _session_turn_admission(session) as admitted:
+         if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
+             return False

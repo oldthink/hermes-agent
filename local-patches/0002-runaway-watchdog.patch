@@ -1,0 +1,503 @@
+diff --git a/agent/runaway_watchdog.py b/agent/runaway_watchdog.py
+new file mode 100644
+index 0000000000..aadd4db8d7
+--- /dev/null
++++ b/agent/runaway_watchdog.py
+@@ -0,0 +1,141 @@
++"""Per-session runaway watchdog (local patch 0002 — this install only, not upstream).
++
++Background-process completions, watch matches, /loop ticks and heartbeats are injected as
++synthetic user-role prompts; each one CLAIMS a new agent turn when the session is idle. The
++per-turn iteration cap resets on every such wake, so a notification chain can run unbounded
++(session c71d14, 2026-10-09). This module bounds that chain per session: after
++``max_synthetic_wakes`` claimed auto-turns (default 25) or ``max_silent_hours`` (default 4h,
++monotonic clock) without a genuine user message, wake sites hold new claims. Held events
++requeue under patch-0001 semantics and batch-deliver after the next user message; a genuine
++user submit (or /stop + a message) releases the hold via ``note_user_message``.
++
++Process-local registry keyed by session id: a restart resets all counters, and a session
++served by two processes (e.g. gateway + desktop) keeps one counter per process — degraded
++(split bound), never stuck. PER-SESSION scope by design: never touches the global estop,
++cron, kanban, or discord.
++
++Limits: ``agent:`` config keys ``runaway_max_synthetic_wakes`` / ``runaway_max_silent_hours``,
++overridden by env ``HERMES_RUNAWAY_MAX_WAKES`` / ``HERMES_RUNAWAY_MAX_SILENT_HOURS`` (testing).
++Any config/env error falls back to the defaults.
++
++Counter semantics (amendment A3): ``should_allow`` is a PURE check — call sites do
++check -> claim -> ``note_claim_success`` ONLY when the claim actually succeeded.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import threading
++import time
++
++logger = logging.getLogger("agent.runaway_watchdog")
++
++_DEFAULT_MAX_WAKES = 25
++_DEFAULT_MAX_SILENT_HOURS = 4.0
++
++_lock = threading.Lock()
++# key -> {"synthetic_wakes": int, "last_user_monotonic": float, "held_notified": bool}
++_states: dict = {}
++
++
++def _limits() -> tuple:
++    """(max_synthetic_wakes, max_silent_hours): config first, env overrides, defaults on any error."""
++    max_wakes = _DEFAULT_MAX_WAKES
++    max_silent_hours = _DEFAULT_MAX_SILENT_HOURS
++    try:
++        from hermes_cli.config import cfg_get, load_config_readonly
++        cfg = load_config_readonly()
++        wakes = cfg_get(cfg, "agent", "runaway_max_synthetic_wakes")
++        if isinstance(wakes, (int, float)) and not isinstance(wakes, bool) and wakes > 0:
++            max_wakes = int(wakes)
++        hours = cfg_get(cfg, "agent", "runaway_max_silent_hours")
++        if isinstance(hours, (int, float)) and not isinstance(hours, bool) and hours > 0:
++            max_silent_hours = float(hours)
++    except Exception:
++        pass
++    try:
++        env_wakes = os.environ.get("HERMES_RUNAWAY_MAX_WAKES", "").strip()
++        if env_wakes:
++            max_wakes = max(1, int(env_wakes))
++    except (TypeError, ValueError):
++        pass
++    try:
++        env_hours = os.environ.get("HERMES_RUNAWAY_MAX_SILENT_HOURS", "").strip()
++        if env_hours:
++            max_silent_hours = max(0.0, float(env_hours))
++    except (TypeError, ValueError):
++        pass
++    return max_wakes, max_silent_hours
++
++
++def _fresh_state() -> dict:
++    return {"synthetic_wakes": 0, "last_user_monotonic": time.monotonic(), "held_notified": False}
++
++
++def register(key: str) -> None:
++    """Lazy-init a session's state (first registration starts the silent-hours clock)."""
++    if not key:
++        return
++    with _lock:
++        if key not in _states:
++            _states[key] = _fresh_state()
++
++
++def note_user_message(key: str) -> None:
++    """A genuine user message arrived: reset the counter and clear the hold notice."""
++    if not key:
++        return
++    with _lock:
++        _states[key] = _fresh_state()
++
++
++def should_allow(key: str, component: str) -> bool:
++    """Pure check: True while the session is under both limits; False (held) once tripped.
++
++    Does NOT increment — callers increment via ``note_claim_success`` only after their claim
++    actually succeeds. The first trip of an episode logs a one-shot notice (``held_notified``
++    latch, cleared by ``note_user_message``); later checks stay silent.
++    """
++    if not key:
++        return True
++    max_wakes, max_silent_hours = _limits()
++    with _lock:
++        state = _states.get(key)
++        if state is None:
++            state = _states[key] = _fresh_state()
++        tripped = (
++            state["synthetic_wakes"] >= max_wakes
++            or (time.monotonic() - state["last_user_monotonic"]) > max_silent_hours * 3600.0
++        )
++        if not tripped:
++            return True
++        if not state["held_notified"]:
++            state["held_notified"] = True
++            logger.warning(
++                "session held by runaway watchdog (%s): %d auto-turns without user input "
++                "(limit %d turns / %.1f h silent) — send a message or /stop; "
++                "held notifications redeliver after the next user message",
++                component, state["synthetic_wakes"], max_wakes, max_silent_hours,
++            )
++        return False
++
++
++def note_claim_success(key: str) -> None:
++    """A synthetic wake actually claimed a turn: count it (call only on successful claims)."""
++    if not key:
++        return
++    with _lock:
++        state = _states.get(key)
++        if state is None:
++            state = _states[key] = _fresh_state()
++        state["synthetic_wakes"] += 1
++
++
++def synthetic_wake_count(key: str) -> int:
++    """Current claimed auto-turn count for ``key`` — for the TUI hold status line (A4)."""
++    if not key:
++        return 0
++    with _lock:
++        state = _states.get(key)
++        return int(state["synthetic_wakes"]) if state is not None else 0
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index e56bec6b93..38245bd3bc 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -258,6 +258,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
+         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
+         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
+             return None
++        # Local patch 0002: a genuine user message past every ingress gate resets the runaway
++        # watchdog. Same keyspace as the watch-injection claim side (run_notifications A2).
++        with suppress(Exception):
++            from agent.runaway_watchdog import note_user_message as _runaway_note_user
++            _runaway_key = self._session_key_for_source(source)
++            if _runaway_key:
++                _runaway_note_user(_runaway_key)
+         return event, source, False
+ 
+     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index 6e1668dd46..559021d6c0 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1280,6 +1280,14 @@ class GatewayNotificationsMixin:
+         if check_paused("watch", logger):
+             return False
+         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
++        # Local patch 0002 (A2): per-session runaway watchdog bounds auto-wake chains. Key on the
++        # canonical session_key (the coalescing field used by completion batching) with the raw
++        # api-server session id as fallback — the same keyspace run_inbound's genuine-user reset
++        # uses (_session_key_for_source). Never origin_session_id: resets would miss and hold forever.
++        from agent.runaway_watchdog import note_claim_success as _runaway_claimed, should_allow as _runaway_allow
++        _runaway_key = str(evt.get("session_key") or "").strip() or _raw_process_event_session_id(evt) or ""
++        if _runaway_key and not _runaway_allow(_runaway_key, "watch"):
++            return False  # held: retryable — the queue redelivers after the next user message
+         source = await asyncio.to_thread(self._build_process_event_source, evt)
+         if not source:
+             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
+@@ -1287,7 +1295,10 @@ class GatewayNotificationsMixin:
+             if raw_sid:
+                 adapter = self.adapters.get(Platform.API_SERVER)
+                 if adapter is not None and not adapter_supports_push(adapter):
+-                    return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
++                    accepted = await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
++                    if accepted and _runaway_key:
++                        _runaway_claimed(_runaway_key)
++                    return accepted
+                 logger.debug(
+                     "Deferring watch notification for raw session %s: no api_server adapter to self-post through",
+                     raw_sid,
+@@ -1310,7 +1321,10 @@ class GatewayNotificationsMixin:
+             # Non-push adapter (api_server): its chat_id IS the raw session id, so handle_message would
+             # key the wake under a build_session_key() that never matches — self-post instead.
+             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+-            return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
++            accepted = await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
++            if accepted and _runaway_key:
++                _runaway_claimed(_runaway_key)
++            return accepted
+         try:
+             metadata = {"notification_origin": "process_registry_synthetic"}
+             synth_text = _mark_internal_notification(synth_text)
+@@ -1351,6 +1365,8 @@ class GatewayNotificationsMixin:
+             if callable(_prime):
+                 _prime(synth_event)
+             await admit_internal_event(adapter, synth_event)
++            if _runaway_key:
++                _runaway_claimed(_runaway_key)
+             return True
+         except WakeNotAccepted:
+             # Durable callers refund the claim; ordinary watch callers just requeue.
+diff --git a/hermes_cli/cli_modal_mixin.py b/hermes_cli/cli_modal_mixin.py
+index a9266b578d..3048284870 100644
+--- a/hermes_cli/cli_modal_mixin.py
++++ b/hermes_cli/cli_modal_mixin.py
+@@ -178,6 +178,13 @@ class CLIModalMixin:
+             _cprint(f"  {t('cli.editor.queued_next_turn', preview=preview)}")
+         else:
+             self._pending_input.put(text)
++        # Local patch 0002: a genuine modal-editor submit resets the runaway watchdog.
++        if _runaway_sid := getattr(self, "session_id", None):
++            try:
++                from agent.runaway_watchdog import note_user_message as _runaway_note_user
++                _runaway_note_user(_runaway_sid)
++            except Exception:
++                pass
+         _done()
+ 
+     def _inline_pastes(self, buffer) -> None:
+diff --git a/hermes_cli/cli_process_notifications.py b/hermes_cli/cli_process_notifications.py
+index d3562c7c85..80849571cf 100644
+--- a/hermes_cli/cli_process_notifications.py
++++ b/hermes_cli/cli_process_notifications.py
+@@ -41,6 +41,13 @@ class CLIProcessNotificationsMixin:
+         # events; the idle/post-turn poller re-drains them as one batch after resume.
+         if check_paused("cli-process-wakes", logging.getLogger("hermes_cli.process_notifications")):
+             return
++        # Local patch 0002: per-session runaway watchdog bounds auto-wake chains. Held = leave
++        # queued (return before draining); a genuine user submit resets the counter (A1).
++        _runaway_key = getattr(self, "session_id", "") or ""
++        if _runaway_key:
++            from agent.runaway_watchdog import note_claim_success as _runaway_claimed, should_allow as _runaway_allow
++            if not _runaway_allow(_runaway_key, "cli"):
++                return
+         from tools.process_registry import process_registry
+         from tools.async_delegation import claim_event_delivery, complete_event_delivery
+         from tools.process_registry_notifications import (
+@@ -72,6 +79,10 @@ class CLIProcessNotificationsMixin:
+                 if diagnostic_process_event(event) and not isinstance(pending, TimelineNotification):
+                     pending = TimelineNotification(text, text, "internal_notification", "diagnostic")
+             self._pending_input.put(pending)
++            if evt_type == "completion" and _runaway_key:
++                # Count only completion batches actually queued (A3) — heartbeat/delegation
++                # groups and suppressed drains do not start a process-completion wake turn.
++                _runaway_claimed(_runaway_key)
+ 
+     def _tui_unwrap_input(self, user_input):
+         """Unwrap ``_VoiceInputMessage`` / ``_SeededQueryMessage`` -> ``(text_or_tuple, is_voice_input, is_seeded_query)``."""
+diff --git a/hermes_cli/cli_tui_mixin.py b/hermes_cli/cli_tui_mixin.py
+index c700f75048..144c9921fd 100644
+--- a/hermes_cli/cli_tui_mixin.py
++++ b/hermes_cli/cli_tui_mixin.py
+@@ -1461,6 +1461,14 @@ class CLITuiMixin:
+         self._attached_images.clear()
+         event.app.invalidate()
+         payload = (text, images) if images else text
++        # Local patch 0002: genuine typing resets the runaway watchdog — both the busy routing
++        # and the idle _pending_input routes below flow through here.
++        if _runaway_sid := getattr(self, "session_id", None):
++            try:
++                from agent.runaway_watchdog import note_user_message as _runaway_note_user
++                _runaway_note_user(_runaway_sid)
++            except Exception:
++                pass
+         # A bang command is treated like a slash command while the agent is busy: it must never
+         # be routed into steer/redirect (injecting `!git status` into the model's context as a
+         # prompt). It queues and runs locally once the loop drains.
+diff --git a/hermes_cli/cli_voice_mixin.py b/hermes_cli/cli_voice_mixin.py
+index 92c2e4af58..4d3ea5f0d7 100644
+--- a/hermes_cli/cli_voice_mixin.py
++++ b/hermes_cli/cli_voice_mixin.py
+@@ -231,6 +231,13 @@ class CLIVoiceMixin:
+                 self._voice_invalidate()
+                 self._pending_input.put(_VoiceInputMessage(transcript))
+                 submitted = True
++                # Local patch 0002: a genuine voice turn resets the runaway watchdog.
++                if _runaway_sid := getattr(self, "session_id", None):
++                    try:
++                        from agent.runaway_watchdog import note_user_message as _runaway_note_user
++                        _runaway_note_user(_runaway_sid)
++                    except Exception:
++                        pass
+             elif result.get("success"):
+                 _cprint(f"{_DIM}{t('cli.voice.no_speech')}{_RST}")
+             else:
+@@ -457,6 +464,13 @@ class CLIVoiceMixin:
+                         return
+                 self._pending_input.put(_VoiceInputMessage(transcript))
+                 submitted = True
++                # Local patch 0002: a genuine voice barge-in resets the runaway watchdog.
++                if _runaway_sid := getattr(self, "session_id", None):
++                    try:
++                        from agent.runaway_watchdog import note_user_message as _runaway_note_user
++                        _runaway_note_user(_runaway_sid)
++                    except Exception:
++                        pass
+             elif not result.get("success"):
+                 _cprint(f"\n{_DIM}{t('cli.voice.transcription_failed', error=result.get('error') or t('cli.shared.unknown_error'))}{_RST}")
+         except Exception as e:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index afa89f42ae..39fbca4e3c 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -90,6 +90,15 @@ DEFAULT_CONFIG = {
+         # on expiry the message is rejected with a resend notice. Keep short: Telegram dispatches
+         # sequentially, so a waiter delays unrelated topics. Non-positive -> 5s.
+         "gateway_turn_lease_timeout": 5,
++        # Local patch 0002 (amended 2026-10-22): runaway watchdog (agent/runaway_watchdog.py)
++        # — after this many claimed synthetic auto-wakes without a genuine user message, or this
++        # many silent hours (float, monotonic), further synthetic wakes are HELD (patch-0001
++        # semantics: requeued, batch-delivered after the next user submit). Env overrides for
++        # testing: HERMES_RUNAWAY_MAX_WAKES / HERMES_RUNAWAY_MAX_SILENT_HOURS. Defaults are the
++        # deliberate post-2026-10-10 incident sizing — keep in sync with
++        # agent.runaway_watchdog._DEFAULT_MAX_WAKES / _DEFAULT_MAX_SILENT_HOURS.
++        "runaway_max_synthetic_wakes": 25,
++        "runaway_max_silent_hours": 4.0,
+         # Per-session AIAgent cache in the gateway. Each entry keeps a warm prompt prefix AND the
+         # full transcript: too small re-pays uncached prompts, too large fills the heap.
+         "agent_cache": {
+diff --git a/tests/hermes_cli/test_runaway_config_keys.py b/tests/hermes_cli/test_runaway_config_keys.py
+new file mode 100644
+index 0000000000..3601012ac4
+--- /dev/null
++++ b/tests/hermes_cli/test_runaway_config_keys.py
+@@ -0,0 +1,39 @@
++"""Local patch 0002 amendment: the watchdog's config keys are registered in DEFAULT_CONFIG.
++
++Before the amendment ``hermes config get agent.runaway_max_synthetic_wakes`` printed a false
++"not a recognized config key" warning: patch 0002 read the keys via ``cfg_get`` but never
++registered them, so ``_validate_config_key``'s nested walk failed (populated ``agent``
++section, missing sub-key). These tests pin registration, validator acceptance, and default
++parity with agent.runaway_watchdog — one deliberate default set (25 wakes / 4 silent hours,
++post-2026-10-10 incident sizing); do not change casually and never out of sync.
++"""
++
++from agent import runaway_watchdog
++from hermes_cli.config import _validate_config_key
++from hermes_cli.config_defaults import DEFAULT_CONFIG
++
++KEYS = ("agent.runaway_max_synthetic_wakes", "agent.runaway_max_silent_hours")
++
++
++def test_runaway_keys_registered_with_deliberate_defaults():
++    agent_cfg = DEFAULT_CONFIG["agent"]
++    assert agent_cfg["runaway_max_synthetic_wakes"] == 25
++    assert agent_cfg["runaway_max_silent_hours"] == 4.0
++
++
++def test_validator_accepts_runaway_keys():
++    for key in KEYS:
++        is_known, suggestion = _validate_config_key(key)
++        assert is_known, f"{key} still flagged unknown (suggestion={suggestion!r})"
++
++
++def test_unknown_agent_sibling_still_unknown():
++    # Control: registering two keys must not open the agent section to typos.
++    is_known, _ = _validate_config_key("agent.runaway_max_bogus_sibling")
++    assert not is_known
++
++
++def test_defaults_match_watchdog_module():
++    # Single-source-of-truth parity: DEFAULT_CONFIG mirrors the runtime fallbacks.
++    assert DEFAULT_CONFIG["agent"]["runaway_max_synthetic_wakes"] == runaway_watchdog._DEFAULT_MAX_WAKES
++    assert DEFAULT_CONFIG["agent"]["runaway_max_silent_hours"] == runaway_watchdog._DEFAULT_MAX_SILENT_HOURS
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 103184b70b..c63f2db83f 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -667,6 +667,12 @@ def _lock_in_submit_turn(
+                 return err, {}
+         session["running"] = True
+         session["_turn_cancel_requested"] = False
++        # Local patch 0002: a genuine prompt submit resets the runaway watchdog, releasing any
++        # held auto-wakes (same sid the claim side in session_notifications uses).
++        if sid:
++            with contextlib.suppress(Exception):
++                from agent.runaway_watchdog import note_user_message as _runaway_note_user
++                _runaway_note_user(sid)
+         session["last_active"] = time.time()
+         if hosted_task is not None:
+             session["_hosted_room_task"] = dict(hosted_task)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 7552219670..d21b83e18a 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -146,7 +146,7 @@ def _notif_release_turn(session: dict) -> None:
+         session["running"] = False
+ 
+ 
+-def _notif_claim_turn(session: dict) -> bool:
++def _notif_claim_turn(session: dict, sid: str = "") -> bool:
+     """Claim the idle session (running=True) under history_lock; False if a turn is live.
+     After the user's Stop no automatic turn starts: the cancel latch holds notifications
+     (requeued by the callers) until the next user prompt clears it."""
+@@ -156,13 +156,38 @@ def _notif_claim_turn(session: dict) -> bool:
+     # them too. Unclaimed events requeue; the poller re-claims and batches them after resume.
+     if check_paused("tui-process-wakes", logging.getLogger("tui_gateway.session_notifications")):
+         return False
++    # Local patch 0002: per-session runaway watchdog bounds auto-wake chains. Refusal requeues
++    # via the callers exactly like the estop gate; the next genuine prompt submit
++    # (methods_prompt._lock_in_submit_turn) resets the counter and releases the hold.
++    if sid:
++        from agent.runaway_watchdog import should_allow as _runaway_allow, synthetic_wake_count
++        if not _runaway_allow(sid, "tui"):
++            _notif_watchdog_hold_status(sid, session, synthetic_wake_count(sid))
++            return False
++        session.pop("_runaway_hold_status_sent", None)
+     with _session_turn_admission(session) as admitted:
+         if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
+             return False
+         session["running"] = True
++        if sid:
++            # Count only a successful claim (A3): presents refused above do not count.
++            from agent.runaway_watchdog import note_claim_success as _runaway_claimed
++            _runaway_claimed(sid)
+         return True
+ 
+ 
++def _notif_watchdog_hold_status(sid: str, session: dict, wakes: int) -> None:
++    """One-shot-per-episode status row when the runaway watchdog holds auto-wakes (patch 0002, A4):
++    desktop/gateway users see the hold instead of a silent hang. The latch clears on the next
++    allowed claim check (i.e. after a genuine user message reset the watchdog)."""
++    if session.get("_runaway_hold_status_sent"):
++        return
++    session["_runaway_hold_status_sent"] = True
++    with contextlib.suppress(Exception):
++        _notif_loop_status(
++            sid, f"runaway watchdog holding auto-wakes ({wakes} without user input); send a message or /stop")
++
++
+ def _notif_log_failure(what: str, exc: BaseException) -> None:
+     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
+ 
+@@ -198,7 +223,7 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str)
+         if out := str(payload.get("output") or "").strip():
+             _notif_loop_status(sid, out)
+         if payload.get("type") == "send" and payload.get("message"):
+-            if not _notif_claim_turn(session):
++            if not _notif_claim_turn(session, sid):
+                 mgr.abandon_tick()
+                 return
+             # Releases the claim on failure: the swallow below would otherwise leave the session busy for good.
+@@ -251,7 +276,7 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
+     mgr = HeartbeatManager(session_id=sid_key)
+     if not mgr.is_active() or not mgr.state.is_due() or _notif_gateway_owns_heartbeat(session, sid_key):
+         return  # not due, or the gateway poller owns the routed conversation — stays due there
+-    if not _notif_claim_turn(session):
++    if not _notif_claim_turn(session, sid):
+         return  # busy — the tick coalesces to the next idle poll
+     if not (prompt := mgr.due_prompt()):
+         _notif_release_turn(session)
+@@ -289,7 +314,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
+     mgr = LoopManager(session_id=sid_key)
+     if not mgr.is_due() or goal_blocks_loop_tick(sid_key) or _loop_route_is_gateway_chat(mgr.state):
+         return  # not due, or the gateway's wakeup scanner owns the routed chat — stays due there
+-    if not _notif_claim_turn(session):
++    if not _notif_claim_turn(session, sid):
+         return  # busy — stays due, next poll retries
+     if not (wakeup := mgr.fire_tick()):
+         _notif_release_turn(session)
+@@ -450,7 +475,7 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
+                             platform="tui", diagnostic=isinstance(text, DiagnosticText))
+     if texts:
+         session.setdefault("_kanban_pending", []).extend(texts)
+-    if not session.get("_kanban_pending") or not _notif_claim_turn(session):
++    if not session.get("_kanban_pending") or not _notif_claim_turn(session, sid):
+         return
+     with session["history_lock"]:
+         pending = session.get("_kanban_pending") or []
+@@ -565,7 +590,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
+     if evt_type == "completion" and completions is not None:
+         completions.append((evt, text))
+         return True
+-    if not _notif_claim_turn(session):
++    if not _notif_claim_turn(session, sid):
+         queue.put(evt)
+         if deferred is not None:
+             return False
+@@ -581,7 +606,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
+ 
+     if not notifications:
+         return
+-    if not _notif_claim_turn(session):
++    if not _notif_claim_turn(session, sid):
+         for event, _text in notifications:
+             (deferred.append if deferred is not None else registry.completion_queue.put)(event)
+         if deferred is None:

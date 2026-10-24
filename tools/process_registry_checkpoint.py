@@ -15,9 +15,63 @@ class ProcessCheckpointMixin:
         """Subclass supplies the live PID decision. See ProcessRegistry."""
         raise NotImplementedError
 
+    def _ensure_detached_sweeper(self) -> None:
+        """Subclass starts the recovered-session exit sweeper. See ProcessRegistry."""
+        raise NotImplementedError
+
+    def _emit_uncollected_exit(self, session) -> None:
+        """Subclass persists the receipt and queues the completion. See ProcessRegistry."""
+        raise NotImplementedError
+
+    # ``completion_queue`` is an instance attribute supplied by the subclass
+    # (ProcessRegistry.__init__); the mixin only requires it exists.
+
+    def _publish_uncollected_recovery_exit(self, entry: Dict[str, Any]) -> None:
+        """Report a checkpointed child whose exit nobody observed.
+
+        The owning process (CLI/serve backend) died before the child did, and
+        the successor never re-adopted it — so no reader thread ran
+        ``_move_to_finished``: no process-results receipt, no completion wake
+        (silent-notify-drop class). Only sessions that asked to be notified
+        (``notify_on_complete``) are reported; a silent server/watcher stays
+        silent. The exit code is unknown — the status was never collected —
+        unless a receipt from an observed exit already exists, in which case
+        that receipt was written by a live owner and nothing was lost: skip.
+
+        Receipt + queue live in ProcessRegistry._emit_uncollected_exit (shared
+        with the detached sweeper); this method only builds the session.
+        """
+        session_id = str(entry.get("session_id") or "")
+        if not session_id or not entry.get("notify_on_complete"):
+            return
+        from tools.process_registry import ProcessSession
+        from tools.process_registry_results import _result_paths
+
+        # An existing receipt proves the exit WAS observed and retained before
+        # the owner died; re-publishing would fabricate an unknown-code exit.
+        if any(path.stem == session_id for path in _result_paths()):
+            logger.info(
+                "Recovered process %s already has a retained result; exit was observed", session_id)
+            return
+        session = ProcessSession(
+            id=session_id, command=entry.get("command", "unknown"),
+            task_id=entry.get("task_id", ""), owner_task_id=entry.get("owner_task_id", ""),
+            session_key=entry.get("session_key", ""),
+            started_at=float(entry.get("started_at") or 0.0),
+            parent_session_id=entry.get("parent_session_id", ""), detached=True,
+            notify_on_complete=True,
+        )
+        with session._lock:
+            session.exited = True
+            session.exit_code = None
+            session.completion_reason = "exited"
+            session.termination_source = "recovery_unobserved"
+        self._emit_uncollected_exit(session)
+
+
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
+    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
@@ -42,32 +96,10 @@ class ProcessCheckpointMixin:
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-                known = {*self._running, *self._finished}
-            from hermes_cli.active_sessions import _FileLock
             from utils import atomic_json_write
-            path = _checkpoint_path()
-            # Every interpreter of the profile (owner, each managed worker) rewrites this file from
-            # its own table; a worker's output-log handoff is its only path to the next one, so a
-            # writer keeps the handoffs it does not track (read-merge-write under one file lock).
-            with _FileLock(path.with_name(path.name + ".lock")):
-                entries.extend(self._foreign_handoffs(path, known))
-                atomic_json_write(path, entries)
+            atomic_json_write(_checkpoint_path(), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
-
-    def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
-        """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
-        the process is alive (same start time) or its recorded exit is waiting to be read."""
-        from pathlib import Path
-        from tools.process_registry_output_log import _exit_path, adoptable_log
-        try:
-            on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            return []
-        return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
-                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
-                and (_exit_path(log).exists() or self._detached_host_fate(
-                    entry.get("pid"), entry.get("host_start_time")) == "running")]
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -76,7 +108,6 @@ class ProcessCheckpointMixin:
             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
-        from tools.process_registry_output_log import adoptable_log
 
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
@@ -86,7 +117,7 @@ class ProcessCheckpointMixin:
         except Exception:
             return 0
         recovered = 0
-        unresolved_scope_entries: list[dict[str, Any]] = []
+        unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
             if not pid:
@@ -108,11 +139,6 @@ class ProcessCheckpointMixin:
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
             fate = self._detached_host_fate(pid, entry.get("host_start_time"))
-            # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
-            # so its reader decides the outcome (a recycled PID is never signalled: fate != running).
-            log = adoptable_log(entry.get("output_log"))
-            if log:
-                fate = "running"
             if fate == "reused":
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
@@ -121,16 +147,6 @@ class ProcessCheckpointMixin:
                     entry.get("session_id", "?"), pid)
                 continue
             if fate != "running":
-                # A notify-on-complete child that died while its owning process was
-                # gone exits UNOBSERVED: nobody collected a status, but the session
-                # that spawned it still must learn it finished. Publish a
-                # reason="lost" wake + durable receipt — unless a receipt already
-                # exists, which proves some earlier owner DID observe the exit.
-                if entry.get("notify_on_complete") and not adoptable_log(entry.get("output_log")):
-                    from hermes_constants import get_hermes_home
-                    receipt = get_hermes_home() / "logs" / "process-results" / f"{entry.get('session_id', '')}.json"
-                    if not receipt.exists():
-                        self._emit_lost_recovery_wake(entry, pid)
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -138,21 +154,27 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
+                    continue
+                # A notify-on-complete child that died while its owner process was
+                # gone exits unobserved: no reader thread ever ran _move_to_finished,
+                # so neither the durable receipt nor the completion wake exists.
+                # Publish a recovery-sourced completion so the exit is at least
+                # reported (exit code unknown — the status was never collected).
+                self._publish_uncollected_recovery_exit(entry)
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             fields.update(
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
-            # detached: no Popen handle, but can report status + kill; a worker spawn's output log
-            # (and recorded exit) outlives its spawner, so tail it from the start.
-            fields["output_log"] = log
+            # detached: can't read output, but can report status + kill
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
-            if session.output_log:
-                self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
-            else:
-                with self._lock:
-                    self._running[session.id] = session
+            with self._lock:
+                self._running[session.id] = session
+            # Recovered children have no reader thread: start the detached sweeper so
+            # their eventual exit is observed (receipt + wake) even in a serve backend
+            # with no gateway watcher loop (t_695b4b52).
+            self._ensure_detached_sweeper()
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
             # Re-enqueue watcher so gateway can resume notifications
@@ -167,55 +189,3 @@ class ProcessCheckpointMixin:
                 })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
-
-    def _emit_lost_recovery_wake(self, entry: dict[str, Any], pid: int) -> None:
-        """Queue a ``reason="lost"`` completion for a checkpointed notify child
-        whose exit nobody observed (its owning process was gone when it died).
-
-        The exit code is unknown by construction — never invented. The receipt
-        makes the loss durable; the queued wake tells the session it owns what
-        happened. Idempotent by the caller's receipt check.
-        """
-        from agent.redact import redact_sensitive_text
-        from tools.process_registry import ProcessSession
-        from tools.process_registry_results import save_completed_result
-
-        session = ProcessSession(
-            id=entry.get("session_id", f"proc_unknown_{pid}"),
-            command=redact_sensitive_text(entry.get("command", "unknown"), code_file=True),
-            task_id=entry.get("task_id", ""),
-            owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
-            started_at=entry.get("started_at", time.time()),
-            pid=pid, pid_scope="host", detached=True,
-            host_start_time=entry.get("host_start_time"),
-            notify_on_complete=True,
-        )
-        with session._lock:
-            session.exited = True
-            session.exited_at = time.time()
-            session.completion_reason = "lost"
-            session.termination_source = "recovery_unobserved"
-        try:
-            save_completed_result(session)
-        except Exception:
-            logger.warning("Lost-recovery receipt for %s failed", session.id, exc_info=True)
-        notification = {
-            "type": "completion",
-            "session_id": session.id,
-            "session_key": entry.get("session_key", ""),
-            "task_id": session.task_id,
-            "owner_task_id": session.owner_task_id,
-            "command": session.command,
-            "exit_code": None,
-            "completion_reason": "lost",
-            "termination_source": "recovery_unobserved",
-            "started_at": session.started_at,
-            "exited_at": session.exited_at,
-        }
-        logger.warning(
-            "Process %s (pid %s) exited while unobserved (owning process was gone); "
-            "publishing a lost completion wake",
-            session.id, pid)
-        from tools.process_registry import process_registry as _global_registry
-        queue = getattr(self, "completion_queue", None) or _global_registry.completion_queue
-        queue.put(notification)

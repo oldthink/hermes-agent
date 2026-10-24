@@ -1,0 +1,414 @@
+diff --git a/agent/skill_utils.py b/agent/skill_utils.py
+index 8f8b115bc0..784329bcf4 100644
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -30,11 +30,23 @@ EXCLUDED_SKILL_DIRS = frozenset((
+ # via skill_view(skill, file_path=...), never scanned as standalone skills.
+ SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+ 
++# Rollback quarantines (skill_manager_batch._restore_snapshot): a leftover
++# ``<skill>.rollback-broken`` dir still carries a duplicate frontmatter ``name:``
++# and re-registers as a same-tier collision for every resolution path. Scanners
++# and edit-target lookups must never see it (RC1/RC3 defense in depth).
++ROLLBACK_QUARANTINE_SUFFIX = ".rollback-broken"
++
++def _is_rollback_quarantine_part(part: str) -> bool:
++    return part.endswith(ROLLBACK_QUARANTINE_SUFFIX)
++
+ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+     """True if *path* should be skipped by skill scanners (VCS/dependency/cache
+-    dirs + support packages). Apply to every SKILL.md from a direct ``rglob``."""
++    dirs + support packages + rollback quarantines). Apply to every SKILL.md
++    from a direct ``rglob``."""
+     parts = PurePath(str(path)).parts
+-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(path, root=root)
++    return (any(part in EXCLUDED_SKILL_DIRS for part in parts)
++            or any(_is_rollback_quarantine_part(part) for part in parts)
++            or is_skill_support_path(path, root=root))
+ 
+ 
+ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
+@@ -841,11 +853,13 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
+ 
+ def iter_skill_index_files(skills_dir: Path, filename: str):
+     """Walk skills_dir yielding sorted paths matching *filename*; prunes
+-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
++    EXCLUDED_SKILL_DIRS, rollback quarantines, and support dirs of skill roots."""
+     matches: list[str] = []
+     for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
+         has_skill_md = "SKILL.md" in files
+-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
++        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS
++                   and not _is_rollback_quarantine_part(d)
++                   and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+         if filename in files:
+             matches.append(os.path.join(root, filename))
+     yield from map(Path, sorted(matches))
+diff --git a/tests/tools/test_skill_manage_batch.py b/tests/tools/test_skill_manage_batch.py
+index 719b8d91db..bb7fddb696 100644
+--- a/tests/tools/test_skill_manage_batch.py
++++ b/tests/tools/test_skill_manage_batch.py
+@@ -309,6 +309,125 @@ class TestSkillManageBatch(unittest.TestCase):
+         self.assertTrue(out["success"], out)
+         self.assertEqual(out["operations_applied"], 2)
+ 
++    def _probe_home_paths(self):
++        skills_root = os.path.join(self.home, "skills")
++        backups_root = os.path.join(self.home, "backups", "skill-rollbacks")
++        return skills_root, backups_root
++
++    def test_rollback_leaves_no_litter_and_aside_lands_in_backups(self):
++        """RC1 dead-proof: a failing batch on a skill whose dir the lane lock later
++        renders read-only must leave NO *.rollback-broken in the skills root, must
++        restore the pre-batch content byte-for-byte, and the aside (only if cleanup
++        itself fails) lives under <home>/backups/skill-rollbacks — outside the tree."""
++        skills_root, backups_root = self._probe_home_paths()
++        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
++        self._call("probe", [{"action": "write_file",
++                              "file_path": "references/r.md", "file_content": "keep"}])
++        before = open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8").read()
++        # 555 the skill dir between snapshot and rollback? Cannot time-travel; instead
++        # make the SKILL.md write fail via a locked dir at op time: lock AFTER create
++        # so the batch's patch op hits a read-only dir mid-batch.
++        os.chmod(os.path.join(skills_root, "probe"), 0o555)
++        try:
++            r = self._call("probe", [
++                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
++            ])
++            self.assertFalse(r["success"], r)
++            self.assertIn("locked", r["error"])
++        finally:
++            os.chmod(os.path.join(skills_root, "probe"), 0o755)
++        # No quarantine litter anywhere in the skills root
++        self.assertEqual([d for d in os.listdir(skills_root) if d.endswith(".rollback-broken")], [])
++        # Content untouched (refused before any effect)
++        after = open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8").read()
++        self.assertEqual(after, before)
++
++    def test_rollback_with_readonly_state_lands_aside_outside_skills(self):
++        """RC1 dead-proof, legacy path: even when a rollback DOES have to move a
++        broken state aside (snapshot restore over a mid-batch failure), the aside
++        lands under backups/skill-rollbacks — never *.rollback-broken in the skills
++        root — and the restore is byte-for-byte."""
++        skills_root, backups_root = self._probe_home_paths()
++        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
++        self._call("probe", [{"action": "write_file",
++                              "file_path": "references/r.md", "file_content": "keep"}])
++        before_files = {}
++        for rel in ("SKILL.md", "references/r.md"):
++            with open(os.path.join(skills_root, "probe", rel), "rb") as fh:
++                before_files[rel] = fh.read()
++        # Force the MID-BATCH failure + rollback path with a read-only dir state:
++        # make the second op's write fail by pre-555-ing the skill dir AFTER the
++        # batch snapshots it — patch the op-time only via _skill_manage_from hook.
++        real_from = self.smt._skill_manage_from
++        state = {"locked": False}
++
++        def lock_before_failing_op(payload, **kw):
++            if payload.get("action") == "write_file" and not state["locked"]:
++                state["locked"] = True
++                os.chmod(os.path.join(skills_root, "probe"), 0o555)
++            return real_from(payload, **kw)
++
++        try:
++            with patch.object(self.smt, "_skill_manage_from", side_effect=lock_before_failing_op):
++                r = self._call("probe", [
++                    {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
++                    {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
++                ])
++            self.assertFalse(r["success"], r)
++        finally:
++            os.chmod(os.path.join(skills_root, "probe"), 0o755)
++        # _restore_snapshot moved the 555 state aside under backups and deleted it hard
++        self.assertEqual([d for d in os.listdir(skills_root) if d.endswith(".rollback-broken")], [])
++        # byte-for-byte restore
++        for rel, raw in before_files.items():
++            with open(os.path.join(skills_root, "probe", rel), "rb") as fh:
++                self.assertEqual(fh.read(), raw, rel)
++        # aside root existed (or still exists only if cleanup failed, which would surface)
++        # and the note surfaced in the error
++        self.assertIn("rolled back", r["error"])
++
++    def test_find_skill_and_candidates_ignore_quarantines(self):
++        """RC3: *.rollback-broken dirs are never edit targets nor load candidates."""
++        from pathlib import Path
++        skills_root = os.path.join(self.home, "skills")
++        os.makedirs(os.path.join(skills_root, "probe"), exist_ok=True)
++        with open(os.path.join(skills_root, "probe", "SKILL.md"), "w", encoding="utf-8") as fh:
++            fh.write(SK.format(n="probe"))
++        os.makedirs(os.path.join(skills_root, "probe.rollback-broken"), exist_ok=True)
++        with open(os.path.join(skills_root, "probe.rollback-broken", "SKILL.md"), "w",
++                  encoding="utf-8") as fh:
++            fh.write(SK.format(n="probe"))
++        found = self.smt._find_skill("probe")
++        self.assertIsNotNone(found)
++        assert found is not None
++        self.assertNotIn(".rollback-broken", str(found["path"]))
++        from agent.skill_utils import iter_skill_index_files
++        scanned = [p.parent.name for p in iter_skill_index_files(Path(skills_root), "SKILL.md")]
++        self.assertEqual(scanned, ["probe"])
++        from tools.skills_tool import _collect_skill_candidates
++        cands = _collect_skill_candidates("probe", None, [Path(skills_root)])
++        self.assertEqual([str(c[0].name) for c in cands], ["probe"])
++
++    def test_failing_batch_failure_control(self):
++        """Failure control: a batch that MUST fail (unmatchable old_string) restores
++        the skill, leaves no litter, no snapshot tempdir, and says so."""
++        skills_root, _ = self._probe_home_paths()
++        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
++        with open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8") as fh:
++            before = fh.read()
++        with tempfile.TemporaryDirectory(prefix="skmbatch_ctl_") as tmp, \
++                patch.dict(os.environ, {"TMPDIR": tmp}), patch.object(tempfile, "tempdir", None):
++            r = self._call("probe", [
++                {"action": "patch", "old_string": "NO SUCH STRING EXISTS",
++                 "new_string": "irrelevant"},
++            ])
++            self.assertFalse(r["success"], r)
++            self.assertIn("rolled back", r["error"])
++            self.assertEqual(os.listdir(tmp), [])  # snapshot tempdir cleaned up
++        self.assertEqual([d for d in os.listdir(skills_root) if d.endswith(".rollback-broken")], [])
++        with open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8") as fh:
++            self.assertEqual(fh.read(), before)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tools/skill_manager_batch.py b/tools/skill_manager_batch.py
+index d312994cd3..812e4b9d9c 100644
+--- a/tools/skill_manager_batch.py
++++ b/tools/skill_manager_batch.py
+@@ -85,7 +85,7 @@ def _op_shape_error(action: str, args: dict):
+ 
+ def _validate_batch_ops(operations, default_name, tool_error):
+     """Shape checks with no side effects. Returns (names, None) or (None, error_json)."""
+-    from tools.skill_manager_guards import _background_review_preflight
++    from tools.skill_manager_guards import _background_review_preflight, _lane_lock_error
+     from tools.skill_manager_tool import _validate_category
+     def fail(i, msg):
+         return None, tool_error(f"operations[{i}]{msg}", success=False)
+@@ -113,6 +113,21 @@ def _validate_batch_ops(operations, default_name, tool_error):
+             return fail(i, f": create for '{nm}' must precede that skill's other ops.")
+         if (preflight := _background_review_preflight(act, nm)) is not None:
+             return None, json.dumps(preflight, ensure_ascii=False)
++        # Lane-lock early refusal (Fix C): a target whose parent dir is not writable would
++        # fail MID-batch (after snapshotting) and cascade into a rollback that historically
++        # left quarantine litter. Refuse before any side effect, with the sanctioned route.
++        if act != "create":
++            from tools import skill_manager_tool as _smt
++            found = _smt._find_skill(nm)
++            if found:
++                skill_dir = Path(found["path"])
++                fp = (op.get("file_path") or "").strip()
++                if fp and act in ("write_file", "remove_file"):
++                    target = skill_dir / posixpath.normpath(fp.lstrip("/"))
++                else:
++                    target = skill_dir / "SKILL.md"
++                if (lock_err := _lane_lock_error(nm, target)) is not None:
++                    return fail(i, f" ({act} on '{nm}'): {lock_err}")
+     # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on
+     # a file an earlier op touched would SILENTLY discard its work — reject it.
+     # Additive patches are always legal. Paths are normalized against spelling variants.
+@@ -155,13 +170,43 @@ def _snapshot_skills(names, snap_root, find_skill, create_targets):
+     return snapshots, None
+ 
+ 
++def _rmtree_hard(path: Path) -> None:
++    """Delete *path* for real: the handler chmods each failing PARENT DIR u+rwx and retries
++    the unlink; a final failure RAISES (never silent). Read-only dirs (lane-skill 555
++    snapshots) made plain rmtree a no-op whose leftovers re-registered as skill-name
++    collisions (RC1)."""
++    import os as _os
++
++    def _handler(fn, p, exc):
++        if isinstance(exc, tuple) and len(exc) > 1:  # onerror hands sys.exc_info()
++            exc = exc[1]
++        try:
++            # Unlink/rmdir need write on the CONTAINING dir, not the entry itself.
++            parent = _os.path.dirname(p)
++            _os.chmod(parent, _os.stat(parent).st_mode | 0o700)
++            fn(p)
++        except OSError as first:
++            try:
++                _os.chmod(p, _os.stat(p).st_mode | 0o700)
++                fn(p)
++            except OSError as final:
++                raise OSError(f"cannot remove '{p}': {final}") from (exc if isinstance(exc, BaseException) else first)
++
++    import shutil as _shutil
++    try:  # onexc: Python 3.12+; 3.14 removed onerror
++        _shutil.rmtree(path, onexc=_handler)
++    except TypeError:  # Python 3.11: onerror only
++        _shutil.rmtree(path, onerror=_handler)
++
++
+ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()) -> None:
+-    post_exists = post_dir is not None and post_dir.is_dir()
++    if post_dir is None or not post_dir.is_dir():
++        if snap is not None:
++            shutil.copytree(snap, pre_dir)
++        return
+     if snap is None:
+-        if not post_exists:
+-            return
+         if not dir_pre_existed:  # Batch created this skill: remove the partial result.
+-            shutil.rmtree(post_dir)
++            _rmtree_hard(post_dir)
+             return
+         # The dir predates the batch (adopted empty leftover): unlink exactly the files the
+         # batch wrote there, then rmdir() the now-empty dirs up to and including the skill dir.
+@@ -178,22 +223,41 @@ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()
+         with suppress(OSError):
+             post_dir.rmdir()
+         return
+-    if not post_exists:
+-        shutil.copytree(snap, pre_dir)
+-        return
+     # Move the broken state aside and delete it only after the snapshot is
+     # back, so a failed copytree (disk full, locked file) can't mean total loss.
+-    aside = post_dir.with_name(post_dir.name + ".rollback-broken")
+-    shutil.rmtree(aside, ignore_errors=True)
+-    post_dir.rename(aside)
++    # The aside lives OUTSIDE the skills tree (<hermes-home>/backups/skill-rollbacks/):
++    # an undeletable leftover inside the skills root kept its duplicate frontmatter
++    # ``name:`` and collided with the live skill on every later resolution (RC1).
++    from hermes_constants import get_hermes_home
++    backups_root = Path(get_hermes_home()) / "backups" / "skill-rollbacks"
++    backups_root.mkdir(parents=True, exist_ok=True)
++    aside = Path(tempfile.mkdtemp(prefix=f"{post_dir.name}-", dir=backups_root))
++    _move_tree(post_dir, aside / "state")
+     try:
+         shutil.copytree(snap, pre_dir)
+     except Exception:
+         # Restore failed: put the half-applied state back rather than nothing.
+         shutil.rmtree(pre_dir, ignore_errors=True)
+-        aside.rename(pre_dir)
++        _move_tree(aside / "state", pre_dir)
++        with suppress(OSError):  # already raising the original; cleanup is best-effort here
++            _rmtree_hard(aside)
+         raise
+-    shutil.rmtree(aside, ignore_errors=True)
++    try:
++        _rmtree_hard(aside)
++    except OSError as exc:
++        # The live skill IS restored; only the quarantine cleanup failed. Name the
++        # aside so the operator can remove it — never a silent leftover (RC1).
++        raise OSError(f"snapshot restored but the quarantined broken state could not be "
++                      f"deleted: '{aside}' ({exc})") from exc
++
++
++def _move_tree(src: Path, dst: Path) -> None:
++    """Rename, falling back to copy+rm across filesystems (EXDEV-safe)."""
++    try:
++        src.rename(dst)
++    except OSError:
++        shutil.copytree(src, dst)
++        _rmtree_hard(src)
+ 
+ 
+ def _rollback(snapshots, find_skill, results):
+diff --git a/tools/skill_manager_guards.py b/tools/skill_manager_guards.py
+index 914c321db2..807db73fe0 100644
+--- a/tools/skill_manager_guards.py
++++ b/tools/skill_manager_guards.py
+@@ -17,6 +17,26 @@ def _refusal(message: str, **extra: Any) -> Dict[str, Any]:
+     return {"success": False, "error": message, **extra}
+ 
+ 
++def _lane_lock_error(name: str, target: Path) -> Optional[str]:
++    """Actionable refusal when a write target's parent dir is not writable (lane skill
++    lock: SKILL.md's dir is 555, references/ stays 755). ``None`` when writable.
++    Checked EARLY — before any snapshot — so a locked target is a loud skip, not a
++    mid-batch permission failure that cascades into a rollback."""
++    import os as _os
++    probe = target.parent
++    try:
++        while not probe.exists():  # a not-yet-created subdir inherits its ancestor's writability
++            if probe.parent == probe:
++                return None  # walked off the tree: let the write path surface the real error
++            probe = probe.parent
++        if _os.access(probe, _os.W_OK):
++            return None
++    except OSError:
++        return None  # unstat-able: let the write path surface the real error
++    return (f"lane skill '{name}' is locked (dir not writable: {probe}); route SKILL.md "
++            f"edits through ~/.hermes/scripts/lane-edit.sh; references/ stays writable by design")
++
++
+ def _is_background_review() -> bool:
+     """True inside the autonomous curator review fork; False on any lookup failure."""
+     try:
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 1d183319e5..16812e0846 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -244,6 +244,10 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+     categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
+     categorized form matches RELATIVE to the local root only (relative_to raises for external dirs).
+ 
++    Rollback quarantines (``*.rollback-broken``) are never edit targets: a rollback that
++    moved the broken state aside must not be re-patched in place (RC3 — the retry used to
++    resolve the quarantine and die on its read-only dir).
++
+     As a last resort the frontmatter ``name:`` is matched too, so the name ``skills list``
+     and the dashboard display (frontmatter name wins over the directory name there)
+     resolves everywhere instead of failing with a misleading "not found in active
+@@ -253,7 +257,7 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+     skill's directory. A display name held by two or more distinct skills resolves to
+     nothing: like skill_view's same-tier collision refusal, refusing to guess beats
+     silently mutating the wrong skill; the directory name still resolves."""
+-    from agent.skill_utils import get_all_skills_dirs
++    from agent.skill_utils import get_all_skills_dirs, _is_rollback_quarantine_part
+     local_root = None
+     if "/" in name or "\\" in name:
+         try:
+@@ -269,6 +273,8 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+         if not skills_dir.exists():
+             continue
+         for skill_dir in _iter_skill_dirs(skills_dir):
++            if _is_rollback_quarantine_part(skill_dir.name):
++                continue  # quarantine litter is never an edit target (RC3)
+             if skill_dir.name == name:
+                 return {"path": skill_dir}
+             if local_root is not None:
+@@ -396,6 +402,9 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
+                    content: str) -> Optional[Dict[str, Any]]:
+     """Read-before-write guard (existing targets only), atomic write, then the security scan;
+     a blocked scan restores the original (or unlinks a new file). Error dict or None."""
++    from tools.skill_manager_guards import _lane_lock_error
++    if lock_err := _lane_lock_error(name, target):
++        return _err(lock_err)
+     original = None
+     if target.exists():
+         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 2cff382992..1d442b4e93 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -344,7 +344,7 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
+     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
+     Every copy is returned so the caller resolves them via ``agent.skill_utils.pick_skill_candidate``
+     (cross-tier precedence; a same-tier tie of different skills is refused, never guessed)."""
+-    from agent.skill_utils import iter_skill_index_files
++    from agent.skill_utils import iter_skill_index_files, _is_rollback_quarantine_part
+     candidates: List[Tuple[Optional[Path], Path]] = []
+     seen_md: set = set()
+ 
+@@ -357,6 +357,8 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
+             candidates.append((sd, smd))
+ 
+     def _record_direct(direct_path: Path, search_root: Path) -> None:  # "mlops/axolotl" / "axolotl" or its flat .md sibling
++        if _is_rollback_quarantine_part(direct_path.name):
++            return  # rollback quarantine: never a load candidate (RC1 defense in depth)
+         flat = direct_path.with_suffix(".md")
+         if not _is_skill_support_path(direct_path) and direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+             _record(direct_path, direct_path / "SKILL.md")
+@@ -370,6 +372,8 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
+         # Recursive by directory name plus frontmatter `name:` — skills_list()
+         # exposes the frontmatter name, so skill_view(name) must accept it too.
+         for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
++            if _is_rollback_quarantine_part(found_skill_md.parent.name):
++                continue  # rollback quarantine: never a load candidate
+             if (found_skill_md.parent.name == name
+                     or _safe_frontmatter(found_skill_md).get("name") == name):
+                 _record(found_skill_md.parent, found_skill_md)

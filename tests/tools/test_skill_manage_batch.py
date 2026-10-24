@@ -309,6 +309,125 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertTrue(out["success"], out)
         self.assertEqual(out["operations_applied"], 2)
 
+    def _probe_home_paths(self):
+        skills_root = os.path.join(self.home, "skills")
+        backups_root = os.path.join(self.home, "backups", "skill-rollbacks")
+        return skills_root, backups_root
+
+    def test_rollback_leaves_no_litter_and_aside_lands_in_backups(self):
+        """RC1 dead-proof: a failing batch on a skill whose dir the lane lock later
+        renders read-only must leave NO *.rollback-broken in the skills root, must
+        restore the pre-batch content byte-for-byte, and the aside (only if cleanup
+        itself fails) lives under <home>/backups/skill-rollbacks — outside the tree."""
+        skills_root, backups_root = self._probe_home_paths()
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        self._call("probe", [{"action": "write_file",
+                              "file_path": "references/r.md", "file_content": "keep"}])
+        before = open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8").read()
+        # 555 the skill dir between snapshot and rollback? Cannot time-travel; instead
+        # make the SKILL.md write fail via a locked dir at op time: lock AFTER create
+        # so the batch's patch op hits a read-only dir mid-batch.
+        os.chmod(os.path.join(skills_root, "probe"), 0o555)
+        try:
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+            ])
+            self.assertFalse(r["success"], r)
+            self.assertIn("locked", r["error"])
+        finally:
+            os.chmod(os.path.join(skills_root, "probe"), 0o755)
+        # No quarantine litter anywhere in the skills root
+        self.assertEqual([d for d in os.listdir(skills_root) if d.endswith(".rollback-broken")], [])
+        # Content untouched (refused before any effect)
+        after = open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8").read()
+        self.assertEqual(after, before)
+
+    def test_rollback_with_readonly_state_lands_aside_outside_skills(self):
+        """RC1 dead-proof, legacy path: even when a rollback DOES have to move a
+        broken state aside (snapshot restore over a mid-batch failure), the aside
+        lands under backups/skill-rollbacks — never *.rollback-broken in the skills
+        root — and the restore is byte-for-byte."""
+        skills_root, backups_root = self._probe_home_paths()
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        self._call("probe", [{"action": "write_file",
+                              "file_path": "references/r.md", "file_content": "keep"}])
+        before_files = {}
+        for rel in ("SKILL.md", "references/r.md"):
+            with open(os.path.join(skills_root, "probe", rel), "rb") as fh:
+                before_files[rel] = fh.read()
+        # Force the MID-BATCH failure + rollback path with a read-only dir state:
+        # make the second op's write fail by pre-555-ing the skill dir AFTER the
+        # batch snapshots it — patch the op-time only via _skill_manage_from hook.
+        real_from = self.smt._skill_manage_from
+        state = {"locked": False}
+
+        def lock_before_failing_op(payload, **kw):
+            if payload.get("action") == "write_file" and not state["locked"]:
+                state["locked"] = True
+                os.chmod(os.path.join(skills_root, "probe"), 0o555)
+            return real_from(payload, **kw)
+
+        try:
+            with patch.object(self.smt, "_skill_manage_from", side_effect=lock_before_failing_op):
+                r = self._call("probe", [
+                    {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                    {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+                ])
+            self.assertFalse(r["success"], r)
+        finally:
+            os.chmod(os.path.join(skills_root, "probe"), 0o755)
+        # _restore_snapshot moved the 555 state aside under backups and deleted it hard
+        self.assertEqual([d for d in os.listdir(skills_root) if d.endswith(".rollback-broken")], [])
+        # byte-for-byte restore
+        for rel, raw in before_files.items():
+            with open(os.path.join(skills_root, "probe", rel), "rb") as fh:
+                self.assertEqual(fh.read(), raw, rel)
+        # aside root existed (or still exists only if cleanup failed, which would surface)
+        # and the note surfaced in the error
+        self.assertIn("rolled back", r["error"])
+
+    def test_find_skill_and_candidates_ignore_quarantines(self):
+        """RC3: *.rollback-broken dirs are never edit targets nor load candidates."""
+        from pathlib import Path
+        skills_root = os.path.join(self.home, "skills")
+        os.makedirs(os.path.join(skills_root, "probe"), exist_ok=True)
+        with open(os.path.join(skills_root, "probe", "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write(SK.format(n="probe"))
+        os.makedirs(os.path.join(skills_root, "probe.rollback-broken"), exist_ok=True)
+        with open(os.path.join(skills_root, "probe.rollback-broken", "SKILL.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(SK.format(n="probe"))
+        found = self.smt._find_skill("probe")
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertNotIn(".rollback-broken", str(found["path"]))
+        from agent.skill_utils import iter_skill_index_files
+        scanned = [p.parent.name for p in iter_skill_index_files(Path(skills_root), "SKILL.md")]
+        self.assertEqual(scanned, ["probe"])
+        from tools.skills_tool import _collect_skill_candidates
+        cands = _collect_skill_candidates("probe", None, [Path(skills_root)])
+        self.assertEqual([str(c[0].name) for c in cands], ["probe"])
+
+    def test_failing_batch_failure_control(self):
+        """Failure control: a batch that MUST fail (unmatchable old_string) restores
+        the skill, leaves no litter, no snapshot tempdir, and says so."""
+        skills_root, _ = self._probe_home_paths()
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        with open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8") as fh:
+            before = fh.read()
+        with tempfile.TemporaryDirectory(prefix="skmbatch_ctl_") as tmp, \
+                patch.dict(os.environ, {"TMPDIR": tmp}), patch.object(tempfile, "tempdir", None):
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "NO SUCH STRING EXISTS",
+                 "new_string": "irrelevant"},
+            ])
+            self.assertFalse(r["success"], r)
+            self.assertIn("rolled back", r["error"])
+            self.assertEqual(os.listdir(tmp), [])  # snapshot tempdir cleaned up
+        self.assertEqual([d for d in os.listdir(skills_root) if d.endswith(".rollback-broken")], [])
+        with open(os.path.join(skills_root, "probe", "SKILL.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

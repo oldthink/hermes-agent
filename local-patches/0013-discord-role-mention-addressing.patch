@@ -1,0 +1,304 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 94dca131e8..3ac6178b63 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -2615,6 +2615,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+                 and not (channel_keys & free_channels)
+                 and not self._in_bot_thread(message)
+                 and not self._self_is_explicitly_mentioned(message)
++                and not self._self_is_role_mentioned(message)
+             ):
+                 return False
+         admitted, role_authorized = self._discord_message_admission(message, claim=False)
+@@ -4976,10 +4977,46 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+         text = str(configured).strip().lower()
+         return text in {"true", "1", "yes", "on"} if truthy else text not in {"false", "0", "no", "off"}
+ 
++    def _extra_or_env_flag_or_csv(
++        self, key: str, env_key: str, env_default: str, *, truthy: bool
++    ) -> Any:
++        """Boolean-ish flag that ALSO accepts a CSV of IDs: ``True``/``False`` or ``{"<id>", ...}``.
++
++        One option then expresses both "on" and "only for these IDs" without a second knob —
++        e.g. ``DISCORD_ROLE_MENTIONS=true`` honours every role the bot holds, while
++        ``DISCORD_ROLE_MENTIONS=1234567890123456701`` honours only that role.
++        """
++        extra = getattr(self.config, "extra", None)
++        configured = _extra_or_secret(extra if isinstance(extra, dict) else None, key, env_key, None)
++        if configured is None:
++            configured = env_default
++        if isinstance(configured, bool):
++            return configured
++        text = str(configured).strip()
++        ids = {tok for tok in re.split(r"[\s,]+", text) if tok.isdigit()}
++        if ids:
++            return ids
++        lowered = text.lower()
++        return lowered in {"true", "1", "yes", "on"} if truthy else lowered not in {"false", "0", "no", "off"}
++
+     def _discord_require_mention(self) -> bool:
+         """Return whether Discord channel messages require a bot mention."""
+         return self._extra_or_env_flag("require_mention", "DISCORD_REQUIRE_MENTION", "true", truthy=False)
+ 
++    def _discord_role_mentions(self) -> Any:
++        """Which role pings address this bot: True = any role it holds, CSV = those role IDs only.
++
++        Discord renders a role ping as ``<@&ROLE_ID>``, which the user-mention parser never
++        sees, so a role ping used to count as "no mention" and get dropped silently in every
++        channel that requires one. Applies to human authors only — bot authors still need a
++        literal ``<@thisbot>`` token (see ``_discord_bots_require_inline_mention``).
++
++        Config: ``discord.role_mentions`` (env ``DISCORD_ROLE_MENTIONS``), default on.
++        """
++        return self._extra_or_env_flag_or_csv(
++            "role_mentions", "DISCORD_ROLE_MENTIONS", "true", truthy=True
++        )
++
+     def _discord_free_response_auto_thread(self) -> bool:
+         """Free-response channels also auto-thread when opted in; default replies inline."""
+         return self._extra_or_env_flag(
+@@ -5193,6 +5230,64 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+             return False
+         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+ 
++    @staticmethod
++    def _raw_mentioned_role_ids(message: Any) -> set:
++        """Role-mention IDs from ``role_mentions`` plus raw ``<@&ID>`` tokens in the content.
++
++        Mirrors ``_raw_mentioned_user_ids``: the raw token is the only evidence for
++        edited/relayed/mobile payloads where Discord's parsed list arrives empty.
++        """
++        ids = {
++            str(getattr(role, "id", "") or "")
++            for role in (getattr(message, "role_mentions", None) or [])
++        }
++        content = getattr(message, "content", "") or ""
++        ids.update(match.group(1) for match in re.finditer(r"<@&(\d+)>", content))
++        ids.discard("")
++        return ids
++
++    def _self_role_ids(self, message: Any) -> set:
++        """Role IDs this bot holds in the message's guild (empty for DMs / unknown guild)."""
++        guild = getattr(message, "guild", None)
++        me = getattr(guild, "me", None) if guild is not None else None
++        roles = getattr(me, "roles", None) or []
++        return {
++            str(getattr(role, "id", "")) for role in roles if getattr(role, "id", None) is not None
++        }
++
++    def _self_is_role_mentioned(self, message: Any) -> bool:
++        """True when the message pings a role this bot actually holds.
++
++        Only roles the bot is a member of can address it, so pinging an unrelated role — or
++        one the bot was removed from — still requires a real @mention. ``role_mentions``
++        further narrows the accepted set to explicit role IDs when configured that way.
++        """
++        allow = self._discord_role_mentions()
++        if allow is False:
++            return False
++        pinged = self._raw_mentioned_role_ids(message)
++        if not pinged:
++            return False
++        own = self._self_role_ids(message)
++        if not own:
++            return False
++        if isinstance(allow, set):
++            own = own & allow
++        return bool(pinged & own)
++
++    def _strip_self_mention_tokens(self, content: str, message: Any) -> str:
++        """Drop the tokens that addressed us — ``<@bot>``, ``<@!bot>`` and held-role pings.
++
++        The agent should see the request, not Discord markup (previously a role ping survived
++        into the prompt as a bare ``<@&ROLE_ID>``).
++        """
++        if self._client and self._client.user:
++            content = content.replace(f"<@{self._client.user.id}>", "")
++            content = content.replace(f"<@!{self._client.user.id}>", "")
++        for role_id in sorted(self._raw_mentioned_role_ids(message) & self._self_role_ids(message)):
++            content = content.replace(f"<@&{role_id}>", "")
++        return content.strip()
++
+     def _discord_bots_require_inline_mention(self) -> bool:
+         """Whether another bot must type an inline @mention to trigger us.
+ 
+@@ -6143,6 +6238,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+         #
+         # Config (discord.* in config.yaml or DISCORD_* env vars):
+         #   discord.require_mention: Require @mention in server channels (default: true)
++        #   discord.role_mentions: Ping a role this bot holds instead of @-ing the bot itself
++        #                          (default: true; a CSV of role IDs limits it to those roles)
+         #   discord.free_response_channels: Channel IDs where bot responds without mention
+         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
+         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
+@@ -6170,11 +6267,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+             if snapshot_text_parts and not raw_content:
+                 raw_content = "\n".join(snapshot_text_parts)
+                 normalized_content = raw_content
+-        if self._self_is_explicitly_mentioned(message):
++        self_mentioned = self._self_is_explicitly_mentioned(message)
++        role_mentioned = self._self_is_role_mentioned(message)
++        if self_mentioned or role_mentioned:
+             mention_prefix = True
+-            if self._client.user:
+-                normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
+-                normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
++            normalized_content = self._strip_self_mention_tokens(normalized_content, message)
+             message.content = normalized_content
+         if not isinstance(message.channel, discord.DMChannel):
+             channel_ids = {str(message.channel.id)}
+diff --git a/tests/gateway/test_discord_role_mentions.py b/tests/gateway/test_discord_role_mentions.py
+new file mode 100644
+index 0000000000..87b615e964
+--- /dev/null
++++ b/tests/gateway/test_discord_role_mentions.py
+@@ -0,0 +1,148 @@
++"""A ping of a role the bot holds addresses it, on every ingress path that requires a mention.
++
++Discord renders role pings as ``<@&ROLE_ID>``; ``_self_is_explicitly_mentioned()`` only parses
++user mentions, so ``<@&role> Raster question...`` in a mention-required channel was dropped
++with no log line at all (the operator cannot even tell it apart from a gateway that never got
++the event). Patch-0013 makes held-role pings count and still keeps bot authors on literal
++``<@thisbot>`` tokens.
++"""
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
++
++import discord
++import pytest
++
++from gateway.platforms.helpers import MessageDeduplicator
++from plugins.platforms.discord.adapter import DiscordAdapter
++
++BOT_ID = 99
++OWN_ROLE = 7001      # managed role named after the bot; the bot holds it
++SHARED_ROLE = 7002   # held by every bot in the guild (e.g. "Definitely Not Sentient")
++FOREIGN_ROLE = 7003  # exists, but this bot is not a member
++CHANNEL_ID = 7
++
++
++def _adapter(*, extra=None) -> DiscordAdapter:
++    adapter = object.__new__(DiscordAdapter)
++    adapter.platform = SimpleNamespace(value="discord")
++    adapter.config = SimpleNamespace(extra=extra or {})
++    adapter._client = SimpleNamespace(user=SimpleNamespace(id=BOT_ID, bot=True))
++    adapter._dedup = MessageDeduplicator()
++    adapter._threads = set()
++    adapter._get_parent_channel_id = Mock(return_value=None)
++    adapter._discord_channel_keys = Mock(return_value={str(CHANNEL_ID)})
++    adapter._discord_free_response_channels = Mock(return_value=set())
++    adapter._handle_message = AsyncMock(return_value=True)
++    return adapter
++
++
++def _msg(content: str, *, held=(OWN_ROLE, SHARED_ROLE), guild=True, role_mentions=()):
++    return SimpleNamespace(
++        id=123,
++        author=SimpleNamespace(id=42, bot=False),
++        channel=SimpleNamespace(id=CHANNEL_ID, parent_id=None),
++        content=content,
++        mentions=[],
++        role_mentions=[SimpleNamespace(id=rid) for rid in role_mentions],
++        guild=(
++            SimpleNamespace(me=SimpleNamespace(roles=[SimpleNamespace(id=r) for r in held]))
++            if guild
++            else None
++        ),
++        type=discord.MessageType.default,
++    )
++
++
++ROLE_PING = f"<@&{OWN_ROLE}> Raster with empty values question - can you check and fill them in?"
++USER_PING = f"<@{BOT_ID}> same question"
++
++
++# ---- detection -------------------------------------------------------------
++
++def test_held_role_ping_is_a_mention(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter()
++    assert adapter._self_is_role_mentioned(_msg(ROLE_PING)) is True
++    # ...and it is still not a *user* mention: the bot-author gates stay untouched.
++    assert adapter._self_is_explicitly_mentioned(_msg(ROLE_PING)) is False
++
++
++def test_foreign_role_ping_is_not_a_mention(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    assert _adapter()._self_is_role_mentioned(_msg(f"<@&{FOREIGN_ROLE}> hi")) is False
++
++
++def test_dm_has_no_roles_so_a_role_ping_never_matches(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    assert _adapter()._self_is_role_mentioned(_msg(ROLE_PING, guild=False)) is False
++
++
++def test_role_mentions_list_alone_is_enough(monkeypatch):
++    """Edited/relayed payloads can carry the parsed list without the raw token."""
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    assert _adapter()._self_is_role_mentioned(
++        _msg("Raster question", role_mentions=[OWN_ROLE])
++    ) is True
++
++
++def test_flag_off_disables_role_addressing(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    assert _adapter(extra={"role_mentions": "false"})._self_is_role_mentioned(_msg(ROLE_PING)) is False
++    monkeypatch.setenv("DISCORD_ROLE_MENTIONS", "off")
++    assert _adapter()._self_is_role_mentioned(_msg(ROLE_PING)) is False
++
++
++def test_csv_pin_limits_which_held_roles_count(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter(extra={"role_mentions": str(OWN_ROLE)})
++    assert adapter._self_is_role_mentioned(_msg(ROLE_PING)) is True
++    # The guild-wide role is held too, but it was not listed: a group ping must not wake us.
++    assert adapter._self_is_role_mentioned(_msg(f"<@&{SHARED_ROLE}> hi")) is False
++
++
++# ---- prompt hygiene --------------------------------------------------------
++
++def test_role_ping_is_stripped_from_the_prompt(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter()
++    assert adapter._strip_self_mention_tokens(ROLE_PING, _msg(ROLE_PING)) == (
++        "Raster with empty values question - can you check and fill them in?"
++    )
++
++
++def test_user_mention_still_stripped(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter()
++    assert adapter._strip_self_mention_tokens(USER_PING, _msg(USER_PING)) == "same question"
++
++
++def test_foreign_role_ping_is_left_alone_in_the_prompt(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter()
++    text = f"<@&{FOREIGN_ROLE}> ask them"
++    assert adapter._strip_self_mention_tokens(text, _msg(text)) == text
++
++
++# ---- ingress ---------------------------------------------------------------
++
++@pytest.mark.asyncio
++async def test_recovered_ingress_admits_a_role_ping(monkeypatch):
++    """The missed-message backfill runs its own mention gate; it must agree with on_message."""
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter()
++    adapter._discord_message_admission = Mock(return_value=(True, False))
++    message = _msg(ROLE_PING)
++
++    assert await adapter._dispatch_recovered_message(message) is True
++    adapter._handle_message.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_recovered_ingress_still_drops_an_unaddressed_message(monkeypatch):
++    monkeypatch.delenv("DISCORD_ROLE_MENTIONS", raising=False)
++    adapter = _adapter()
++    adapter._discord_message_admission = Mock(return_value=(True, False))
++
++    assert await adapter._dispatch_recovered_message(_msg(f"<@&{FOREIGN_ROLE}> ask them")) is False
++    adapter._handle_message.assert_not_awaited()
+\ No newline at end of file
